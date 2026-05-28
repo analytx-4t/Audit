@@ -1,5 +1,6 @@
 import ImageUpload from "./components/ImageUpload";
 import ExcelUpload from "./components/ExcelUpload";
+import RenameImagesPage from "./pages/RenameImagesPage";
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
 import ProtectedRoute from "./components/ProtectedRoute";
 import ErrorPage from "./pages/ErrorPage";
@@ -25,6 +26,10 @@ export const router = createBrowserRouter([
               {
                 path: "/",
                 element: <ImageUpload />,
+              },
+              {
+                path: "/rename",
+                element: <RenameImagesPage />,
               },
               {
                 path: "/combine",
