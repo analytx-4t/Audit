@@ -150,7 +150,9 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
           </div>
           <div className="flex items-center gap-2">
             {selectedFiles.length > 0 && <CheckCircle2 className={`w-5 h-5 ${accent.checkColor}`} />}
-            <span className={`text-[10px] font-semibold px-2.5 py-1 rounded-full ${accent.badge}`}>All types</span>
+            <span className={`text-[10px] font-semibold px-2.5 py-1 rounded-full ${accent.badge}`}>
+              {types.length === 1 && types[0] === "image" ? "Images only" : "All types"}
+            </span>
           </div>
         </div>
 
@@ -208,14 +210,16 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
             <p className="text-gray-600 dark:text-white/60 text-sm font-medium">
               {isDragging ? "Drop files here" : "Click to upload"}
             </p>
-            <p className="text-gray-400 dark:text-white/30 text-xs mt-1">Images, PDF, Excel · Multiple allowed</p>
+            <p className="text-gray-400 dark:text-white/30 text-xs mt-1">
+              {types.length === 1 && types[0] === "image" ? "Images only · Multiple allowed" : "Images, PDF, Excel · Multiple allowed"}
+            </p>
           </div>
         )}
 
         <input
           ref={fileInputRef}
           type="file"
-          accept="*/*"
+          accept={types.length === 1 && types[0] === "image" ? "image/*" : "*/*"}
           multiple
           className="hidden"
           onChange={(e) => {
@@ -233,7 +237,9 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
             transition-all duration-150 active:scale-[0.98] hover:-translate-y-0.5 hover:shadow-xl`}
         >
           <Upload className="w-4 h-4" />
-          {selectedFiles.length > 0 ? "Add More Files" : "Local Upload"}
+          {selectedFiles.length > 0
+            ? (types.length === 1 && types[0] === "image" ? "Add More Images" : "Add More Files")
+            : (types.length === 1 && types[0] === "image" ? "Upload Images" : "Local Upload")}
         </button>
       </div>
 

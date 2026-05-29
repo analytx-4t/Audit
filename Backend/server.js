@@ -59,8 +59,10 @@ Extract the following details from invoice text and return ONLY JSON:
   "grand_total": "",
   "hyp_hps": "",
   "tag": "",
-  "fuel_type": ""
-  
+  "fuel_type": "",
+  "city": "",
+  "state": "",
+  "country": ""
 }
 
 Rules:
@@ -111,6 +113,13 @@ CRITICAL VIN DETECTION:
 - Only consider exact 17-character strings as VIN.
 
 IMPORTANT: If the text contains only a single long alphanumeric code (typically 17 characters) and no invoice details, treat that code as the VIN. Set tag = "audit_image" and leave all other fields empty (except fuel_type if detected).
+
+CITY / STATE / COUNTRY EXTRACTION:
+- Look for address blocks in "Bill To", "Ship To", "Buyer", "Consignee", or any address section.
+- Extract the city name (e.g. "Mumbai", "Delhi", "Pune") into "city".
+- Extract the state name (e.g. "Maharashtra", "Karnataka") into "state".
+- Extract the country (e.g. "India") into "country". Default to "India" if an address is present but country is not explicitly stated.
+- If no address is found, leave all three as empty strings.
 
 Return only valid JSON.
         `,
@@ -288,6 +297,9 @@ app.post("/api/extract", upload.array("files"), async (req, res) => {
   { header: "Invoice Date",   key: "invoice_date",     width: 14 },
   { header: "Grand Total",    key: "grand_total",      width: 14 },
   { header: "HYP/HPS",        key: "hyp_hps",          width: 10 },
+  { header: "City",           key: "city",             width: 14 },
+  { header: "State",          key: "state",            width: 16 },
+  { header: "Country",        key: "country",          width: 12 },
   { header: "VIN Found",      key: "vin_found",        width: 12 },
 ];
 
@@ -316,13 +328,14 @@ headerRow.height = 20;
         continue;
       }
 
-      const vinFound = aiResult.vin?.trim() !== "";
+      const vin = aiResult.vin?.trim() || "";
+      const vinValid = vin.length === 17;
 
-      if (!vinFound) {
+      if (!vinValid) {
         failedFiles.push(file);
       }
 
-      const vehicleKey = `${aiResult.vin.trim().toLowerCase()}_${aiResult.engine_number.trim().toLowerCase()}`;
+      const vehicleKey = `${vin.toLowerCase()}_${aiResult.engine_number.trim().toLowerCase()}`;
       // this is  done hai
       // if (uniqueVehicles.has(vehicleKey)) {
       //   console.log("Duplicate skipped:", vehicleKey);
@@ -341,7 +354,10 @@ headerRow.height = 20;
         invoice_date: aiResult.invoice_date,
         grand_total: aiResult.grand_total,
         hyp_hps: aiResult.hyp_hps,
-        vin_found: vinFound ? "Yes" : "No",
+        city: aiResult.city,
+        state: aiResult.state,
+        country: aiResult.country,
+        vin_found: vinValid ? "Yes" : "Failed",
       });
 
      const dataRow = worksheet.addRow([
@@ -354,7 +370,10 @@ headerRow.height = 20;
   aiResult.invoice_date,
   aiResult.grand_total,
   aiResult.hyp_hps,
-  vinFound ? "Yes" : "No",
+  aiResult.city,
+  aiResult.state,
+  aiResult.country,
+  vinValid ? "Yes" : "Failed",
 ]);
 
 // ── Style each data row ──
@@ -374,9 +393,9 @@ dataRow.eachCell((cell) => {
   };
 });
 
-// ── Color "VIN Found" cell: green=Yes, red=No ──
-const vinCell = dataRow.getCell(10);
-if (vinFound) {
+// ── Color "VIN Found" cell: green=Yes, red=Failed ──
+const vinCell = dataRow.getCell(13);
+if (vinValid) {
   vinCell.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF375623" } };
   vinCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC6EFCE" } };
 } else {

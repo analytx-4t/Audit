@@ -12,7 +12,7 @@ function ImageUpload() {
   const [filesMap, setFilesMap] = useState<Record<number, File[]>>({});
 
   const imageCards = [
-    { id: 1, title: "Car Image",         subtitle: "Vehicle photos & docs",    icon: Monitor,  accentColor: "blue"   as const },
+    { id: 1, title: "2/4 Wheeler & Commercial Vehicle", subtitle: "2/4 Wheeler & Commercial Vehicle", icon: Monitor, accentColor: "blue" as const },
     { id: 2, title: "Sales / Insurance", subtitle: "Policy & sales documents", icon: FileText, accentColor: "violet" as const },
     { id: 3, title: "Purchase Invoice",  subtitle: "Transaction receipts",     icon: Receipt,  accentColor: "rose"   as const },
   ];
@@ -109,7 +109,7 @@ function ImageUpload() {
               subtitle={card.subtitle}
               icon={card.icon}
               accentColor={card.accentColor}
-              types={["image", "pdf", "excel", "any"]}
+              types={card.id === 1 ? ["image"] : ["image", "pdf", "excel", "any"]}
               onFilesChange={(cardFiles) => handleCardFiles(card.id, cardFiles)}
             />
           ))}
