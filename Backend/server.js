@@ -21,7 +21,8 @@ app.use(
       "https://audit-tool-one.vercel.app",
       "https://audit-tool-ipri.vercel.app",
       "https://audit-tool-new.vercel.app",
-      "https://audit-tool-bfn1.vercel.app"
+      "https://audit-tool-bfn1.vercel.app",
+      "https://audit-eight-tau.vercel.app/"
     ],
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true,
