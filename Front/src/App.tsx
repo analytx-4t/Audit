@@ -1,5 +1,6 @@
 import ImageUpload from "./components/ImageUpload";
 import ExcelUpload from "./components/ExcelUpload";
+import RenameImages from "./components/RenameImages";
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
 import ProtectedRoute from "./components/ProtectedRoute";
 import ErrorPage from "./pages/ErrorPage";
@@ -34,6 +35,10 @@ export const router = createBrowserRouter([
                     <ExcelUpload />
                   </>
                 ),
+              },
+              {
+                path: "/rename-images",
+                element: <RenameImages />,
               },
             ],
           },

@@ -58,7 +58,7 @@ export default function Header() {
         {[
           { label: "Excel Upload", to: "/combine" },
           { label: "Image Upload", to: "/" },
-          // { label: "Reports", to: "/reports" },
+          { label: "Rename Images", to: "/rename-images" },
         ].map(({ label, to }) => (
           <NavLink
             key={label}
