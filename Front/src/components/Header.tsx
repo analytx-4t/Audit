@@ -56,9 +56,9 @@ export default function Header() {
       {/* Nav */}
       <nav className="hidden md:flex items-center gap-1">
         {[
+          { label: "Rename Images", to: "/rename" },
           { label: "Image Upload", to: "/" },
           { label: "Excel Upload", to: "/combine" },
-          { label: "Rename Images", to: "/rename" },
           // { label: "Reports", to: "/reports" },
         ].map(({ label, to }) => (
           <NavLink
