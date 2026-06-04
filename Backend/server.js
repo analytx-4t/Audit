@@ -10,6 +10,7 @@ import ExcelJS from "exceljs";
 // import path from "path";
 import { Readable } from "stream";
 import archiver from "archiver";
+import crypto from "crypto";
 // import fs from "fs";
 
 config();
@@ -158,10 +159,12 @@ Return only valid JSON.
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024,       // 10MB per file
-    files: 200,                         // max number of files
+    fileSize: 10 * 1024 * 1024,
+    files: 1000,
   },
 });
+
+const jobStore = new Map();
 app.get("/", (req, res) => {
   return res.json({ message: " Server started at 5000" });
 });
@@ -257,17 +260,22 @@ async function processOneFile(file, retries = MAX_RETRIES) {
 }
 
 // ─── HELPER: run array in batches ─────────────────────────
-async function processBatches(files) {
+async function processBatches(files, onFileProcessed = () => {}) {
   const allResults = [];
 
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
     const batch = files.slice(i, i + BATCH_SIZE);
     console.log(`Processing batch ${Math.ceil(i / BATCH_SIZE) + 1} / ${Math.ceil(files.length / BATCH_SIZE)}`);
 
-    const batchResults = await Promise.all(batch.map((f) => processOneFile(f)));
+    const batchResults = await Promise.all(
+      batch.map(async (f) => {
+        const result = await processOneFile(f);
+        onFileProcessed();
+        return result;
+      })
+    );
     allResults.push(...batchResults);
 
-    // Pause between batches to avoid rate limiting
     if (i + BATCH_SIZE < files.length) {
       await sleep(DELAY_BETWEEN_BATCHES);
     }
@@ -279,151 +287,170 @@ async function processBatches(files) {
 
 
 
-app.post("/api/extract", upload.array("files"), async (req, res) => {
+app.post("/api/extract", (req, res, next) => {
+  upload.array("files")(req, res, (err) => {
+    if (err) {
+      console.error("Multer error:", err.message);
+      return res.status(400).json({ error: err.message || "File upload error" });
+    }
+    next();
+  });
+}, (req, res) => {
+  const files = req.files;
+  if (!files || files.length === 0) {
+    return res.status(400).json({ error: "No files uploaded" });
+  }
+  const jobId = crypto.randomUUID();
+  jobStore.set(jobId, { status: "processing", total: files.length, processed: 0, result: null, error: null, clients: [] });
+  res.json({ jobId, total: files.length });
+  runJob(jobId, files);
+});
+
+// ─── SSE PROGRESS ─────────────────────────────────────────
+app.get("/api/progress/:jobId", (req, res) => {
+  const job = jobStore.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  send({ processed: job.processed, total: job.total, status: job.status });
+  job.clients.push(send);
+
+  req.on("close", () => {
+    job.clients = job.clients.filter((c) => c !== send);
+  });
+});
+
+// ─── DOWNLOAD RESULT ──────────────────────────────────────
+app.get("/api/result/:jobId", (req, res) => {
+  const job = jobStore.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Not found" });
+  if (job.status === "error") return res.status(500).json({ error: job.error });
+  if (job.status !== "done") return res.status(202).json({ status: job.status });
+
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", "attachment; filename=result.zip");
+  res.send(job.result);
+
+  setTimeout(() => jobStore.delete(req.params.jobId), 60_000);
+});
+
+// ─── JOB RUNNER ───────────────────────────────────────────
+async function runJob(jobId, files) {
+  const job = jobStore.get(jobId);
   try {
-    const files = req.files;
-    const results = [];
     const failedFiles = [];
     const uniqueVehicles = new Set();
 
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet("Sheet1");
-   worksheet.columns = [
-  { header: "File Name",      key: "file_name",       width: 12 },
-  { header: "VIN",            key: "vin",              width: 22 },
-  { header: "Engine Number",  key: "engine_number",    width: 18 },
-  { header: "HMIL",           key: "hmil",             width: 10 },
-  { header: "Tag",            key: "tag",              width: 14 },
-  { header: "Invoice Number", key: "invoice_number",   width: 18 },
-  { header: "Invoice Date",   key: "invoice_date",     width: 14 },
-  { header: "Grand Total",    key: "grand_total",      width: 14 },
-  { header: "HYP/HPS",        key: "hyp_hps",          width: 10 },
-  { header: "City",           key: "city",             width: 14 },
-  { header: "State",          key: "state",            width: 16 },
-  { header: "Country",        key: "country",          width: 12 },
-  { header: "VIN Found",      key: "vin_found",        width: 12 },
-];
+    worksheet.columns = [
+      { header: "File Name",      key: "file_name",       width: 12 },
+      { header: "VIN",            key: "vin",              width: 22 },
+      { header: "Engine Number",  key: "engine_number",    width: 18 },
+      { header: "HMIL",           key: "hmil",             width: 10 },
+      { header: "Tag",            key: "tag",              width: 14 },
+      { header: "Invoice Number", key: "invoice_number",   width: 18 },
+      { header: "Invoice Date",   key: "invoice_date",     width: 14 },
+      { header: "Grand Total",    key: "grand_total",      width: 14 },
+      { header: "HYP/HPS",        key: "hyp_hps",          width: 10 },
+      { header: "City",           key: "city",             width: 14 },
+      { header: "State",          key: "state",            width: 16 },
+      { header: "Country",        key: "country",          width: 12 },
+      { header: "VIN Found",      key: "vin_found",        width: 12 },
+    ];
 
-// ── Style header row ──
-const headerRow = worksheet.getRow(1);
-headerRow.eachCell((cell) => {
-  cell.font = { name: "Arial", bold: true, size: 11, color: { argb: "FFFFFFFF" } };
-  cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
-  cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
-  cell.border = {
-    top:    { style: "thin", color: { argb: "FF000000" } },
-    left:   { style: "thin", color: { argb: "FF000000" } },
-    bottom: { style: "thin", color: { argb: "FF000000" } },
-    right:  { style: "thin", color: { argb: "FF000000" } },
-  };
-});
-headerRow.height = 20;
+    const headerRow = worksheet.getRow(1);
+    headerRow.eachCell((cell) => {
+      cell.font = { name: "Arial", bold: true, size: 11, color: { argb: "FFFFFFFF" } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
+      cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+      cell.border = {
+        top:    { style: "thin", color: { argb: "FF000000" } },
+        left:   { style: "thin", color: { argb: "FF000000" } },
+        bottom: { style: "thin", color: { argb: "FF000000" } },
+        right:  { style: "thin", color: { argb: "FF000000" } },
+      };
+    });
+    headerRow.height = 20;
 
-    // ── Process all files in controlled batches ──
-    const allResults = await processBatches(files);
+    const notify = () => {
+      job.processed++;
+      const update = { processed: job.processed, total: job.total, status: "processing" };
+      job.clients.forEach((send) => send(update));
+    };
 
-    // ── Build Excel & results ──
+    const allResults = await processBatches(files, notify);
+
     for (const { file, aiResult, success } of allResults) {
-      if (!success || !aiResult) {
-        failedFiles.push(file);
-        continue;
-      }
+      if (!success || !aiResult) { failedFiles.push(file); continue; }
 
       const vin = aiResult.vin?.trim() || "";
       const vinValid = vin.length === 17;
-
-      if (!vinValid) {
-        failedFiles.push(file);
-      }
+      if (!vinValid) failedFiles.push(file);
 
       const vehicleKey = `${vin.toLowerCase()}_${aiResult.engine_number.trim().toLowerCase()}`;
-      // this is  done hai
-      // if (uniqueVehicles.has(vehicleKey)) {
-      //   console.log("Duplicate skipped:", vehicleKey);
-      //   continue;
-      // }
-
       uniqueVehicles.add(vehicleKey);
 
-      results.push({
-        fileName: file.originalname,
-        vin: aiResult.vin,
-        engine_number: aiResult.engine_number,
-        hmil: aiResult.hmil,
-        tag: aiResult.tag,
-        invoice_number: aiResult.invoice_number,
-        invoice_date: aiResult.invoice_date,
-        grand_total: aiResult.grand_total,
-        hyp_hps: aiResult.hyp_hps,
-        city: aiResult.city,
-        state: aiResult.state,
-        country: aiResult.country,
-        vin_found: vinValid ? "Yes" : "Failed",
+      const dataRow = worksheet.addRow([
+        file.originalname, aiResult.vin, aiResult.engine_number, aiResult.hmil,
+        aiResult.tag, aiResult.invoice_number, aiResult.invoice_date, aiResult.grand_total,
+        aiResult.hyp_hps, aiResult.city, aiResult.state, aiResult.country,
+        vinValid ? "Yes" : "Failed",
+      ]);
+
+      const isEven = dataRow.number % 2 === 0;
+      dataRow.eachCell((cell) => {
+        cell.font = { name: "Arial", size: 10 };
+        cell.alignment = { horizontal: "center", vertical: "middle" };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: isEven ? "FFD9E1F2" : "FFFFFFFF" } };
+        cell.border = {
+          top:    { style: "thin", color: { argb: "FFB8CCE4" } },
+          left:   { style: "thin", color: { argb: "FFB8CCE4" } },
+          bottom: { style: "thin", color: { argb: "FFB8CCE4" } },
+          right:  { style: "thin", color: { argb: "FFB8CCE4" } },
+        };
       });
 
-     const dataRow = worksheet.addRow([
-  file.originalname,
-  aiResult.vin,
-  aiResult.engine_number,
-  aiResult.hmil,
-  aiResult.tag,
-  aiResult.invoice_number,
-  aiResult.invoice_date,
-  aiResult.grand_total,
-  aiResult.hyp_hps,
-  aiResult.city,
-  aiResult.state,
-  aiResult.country,
-  vinValid ? "Yes" : "Failed",
-]);
-
-// ── Style each data row ──
-const isEven = dataRow.number % 2 === 0;
-dataRow.eachCell((cell) => {
-  cell.font = { name: "Arial", size: 10 };
-  cell.alignment = { horizontal: "center", vertical: "middle" };
-  cell.fill = {
-    type: "pattern", pattern: "solid",
-    fgColor: { argb: isEven ? "FFD9E1F2" : "FFFFFFFF" },  // alternating rows
-  };
-  cell.border = {
-    top:    { style: "thin", color: { argb: "FFB8CCE4" } },
-    left:   { style: "thin", color: { argb: "FFB8CCE4" } },
-    bottom: { style: "thin", color: { argb: "FFB8CCE4" } },
-    right:  { style: "thin", color: { argb: "FFB8CCE4" } },
-  };
-});
-
-// ── Color "VIN Found" cell: green=Yes, red=Failed ──
-const vinCell = dataRow.getCell(13);
-if (vinValid) {
-  vinCell.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF375623" } };
-  vinCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC6EFCE" } };
-} else {
-  vinCell.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF9C0006" } };
-  vinCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } };
-}
+      const vinCell = dataRow.getCell(13);
+      if (vinValid) {
+        vinCell.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF375623" } };
+        vinCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC6EFCE" } };
+      } else {
+        vinCell.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF9C0006" } };
+        vinCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } };
+      }
     }
 
-    // ── ZIP response ──
     const excelBuffer = await workbook.xlsx.writeBuffer();
 
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", "attachment; filename=result.zip");
-
-    const archive = archiver("zip", { zlib: { level: 9 } });
-    archive.pipe(res);
-    archive.append(excelBuffer, { name: "vehicles.xlsx" });
-    failedFiles.forEach((file) => {
-      archive.append(file.buffer, { name: `failed/${file.originalname}` });
+    const zipBuffer = await new Promise((resolve, reject) => {
+      const archive = archiver("zip", { zlib: { level: 9 } });
+      const buffers = [];
+      archive.on("data", (d) => buffers.push(d));
+      archive.on("end", () => resolve(Buffer.concat(buffers)));
+      archive.on("error", reject);
+      archive.append(excelBuffer, { name: "vehicles.xlsx" });
+      failedFiles.forEach((f) => archive.append(f.buffer, { name: `failed/${f.originalname}` }));
+      archive.finalize();
     });
 
-    await archive.finalize();
+    job.result = zipBuffer;
+    job.status = "done";
+    job.clients.forEach((send) => send({ processed: job.total, total: job.total, status: "done" }));
   } catch (error) {
     console.error(error.response?.data || error.message);
-    res.status(500).json({ error: "OCR Failed" });
+    job.status = "error";
+    job.error = "OCR Failed";
+    job.clients.forEach((send) => send({ status: "error", error: "OCR Failed" }));
   }
-});
+
+  setTimeout(() => jobStore.delete(jobId), 10 * 60_000);
+}
 
 
 
@@ -655,7 +682,7 @@ app.post(
       const masterSheet = masterWorkbook.worksheets[0];
 
       // 🔎 Detect Required Columns in Custom
-      let vinCol, tagCol, invoiceCol, dateCol, totalCol, hypCol;
+      let vinCol, tagCol, invoiceCol, dateCol, totalCol, hypCol, cityCol, stateCol, countryCol;
 
       customSheet.getRow(1).eachCell((cell, colNumber) => {
         const header = cell.value?.toString().trim().toUpperCase();
@@ -666,7 +693,12 @@ app.post(
         if (header === "INVOICE DATE") dateCol = colNumber;
         if (header === "GRAND TOTAL") totalCol = colNumber;
         if (header === "HYP/HPS" || header === "HYP/HPA") hypCol = colNumber;
+        if (header === "CITY") cityCol = colNumber;
+        if (header === "STATE") stateCol = colNumber;
+        if (header === "COUNTRY") countryCol = colNumber;
       });
+
+      console.log("Detected columns in custom file:", { vinCol, tagCol, invoiceCol, dateCol, totalCol, hypCol, cityCol, stateCol, countryCol });
 
       if (!vinCol) {
         return res
@@ -706,8 +738,17 @@ app.post(
           invoice_date: row.getCell(dateCol)?.value || "",
           grand_total: row.getCell(totalCol)?.value || "",
           hyp: row.getCell(hypCol)?.value || "",
+          city: row.getCell(cityCol)?.value || "",
+          state: row.getCell(stateCol)?.value || "",
+          country: row.getCell(countryCol)?.value || "",
         });
       });
+
+      // Debug: show first vinMap entry
+      if (vinMap.size > 0) {
+        const [sampleVin, sampleData] = vinMap.entries().next().value;
+        console.log("Sample vinMap entry:", { vin: sampleVin, city: sampleData.city, state: sampleData.state, country: sampleData.country });
+      }
 
       // 🔥 Add New Columns in Master
       const foundCol = masterSheet.columnCount + 1;
@@ -717,16 +758,20 @@ app.post(
       const invoiceDateColMaster = masterSheet.columnCount + 5;
       const totalColMaster = masterSheet.columnCount + 6;
       const hypColMaster = masterSheet.columnCount + 7;
+      const cityColMaster = masterSheet.columnCount + 8;
+      const stateColMaster = masterSheet.columnCount + 9;
+      const countryColMaster = masterSheet.columnCount + 10;
 
       masterSheet.getRow(1).getCell(foundCol).value = "Found (YES OR NO)";
       masterSheet.getRow(1).getCell(matchedCol).value = "Matched_CHASSIS_NO";
-      masterSheet.getRow(1).getCell(purchaseVerifiedCol).value =
-        "Purchase_Verified";
+      masterSheet.getRow(1).getCell(purchaseVerifiedCol).value = "Purchase_Verified";
       masterSheet.getRow(1).getCell(invoiceColMaster).value = "Invoice Number";
-      masterSheet.getRow(1).getCell(invoiceDateColMaster).value =
-        "Invoice Date";
+      masterSheet.getRow(1).getCell(invoiceDateColMaster).value = "Invoice Date";
       masterSheet.getRow(1).getCell(totalColMaster).value = "Grand Total";
       masterSheet.getRow(1).getCell(hypColMaster).value = "HYP/HPA";
+      masterSheet.getRow(1).getCell(cityColMaster).value = "City";
+      masterSheet.getRow(1).getCell(stateColMaster).value = "State";
+      masterSheet.getRow(1).getCell(countryColMaster).value = "Country";
 
       // 🔎 Compare Data
       masterSheet.eachRow((row, rowNumber) => {
@@ -743,6 +788,10 @@ app.post(
 
           row.getCell(foundCol).value = "YES";
           row.getCell(matchedCol).value = chassisVal;
+
+          row.getCell(cityColMaster).value = customData.city;
+          row.getCell(stateColMaster).value = customData.state;
+          row.getCell(countryColMaster).value = customData.country;
 
           if (customData.tag === "purchase") {
             row.getCell(purchaseVerifiedCol).value = "YES";

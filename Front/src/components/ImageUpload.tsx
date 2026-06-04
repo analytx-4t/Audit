@@ -8,6 +8,7 @@ const Backend = import.meta.env.VITE_BACKEND;
 
 function ImageUpload() {
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState<{ processed: number; total: number } | null>(null);
   const [excelBlob, setExcelBlob] = useState<Blob | null>(null);
   const [filesMap, setFilesMap] = useState<Record<number, File[]>>({});
 
@@ -28,16 +29,41 @@ function ImageUpload() {
     if (files.length === 0) return;
     setLoading(true);
     setExcelBlob(null);
+    setProgress(null);
     try {
+      // Step 1: Upload files, receive a job ID immediately
       const formData = new FormData();
       files.forEach((file) => formData.append("files", file));
-      const res = await fetch(`${Backend}/api/extract`, { method: "POST", body: formData });
-      if (!res.ok) throw new Error("Failed");
-      setExcelBlob(await res.blob());
-    } catch {
-      alert("Something went wrong");
+      const uploadRes = await fetch(`${Backend}/api/extract`, { method: "POST", body: formData });
+      if (!uploadRes.ok) {
+        const err = await uploadRes.json().catch(() => ({}));
+        throw new Error(err.error || "Upload failed");
+      }
+      const { jobId, total } = await uploadRes.json();
+      setProgress({ processed: 0, total });
+
+      // Step 2: Subscribe to SSE progress stream
+      await new Promise<void>((resolve, reject) => {
+        const es = new EventSource(`${Backend}/api/progress/${jobId}`);
+        es.onmessage = (e) => {
+          const data = JSON.parse(e.data);
+          if (data.status === "error") { es.close(); reject(new Error(data.error || "Processing failed")); return; }
+          setProgress({ processed: data.processed, total: data.total });
+          if (data.status === "done") { es.close(); resolve(); }
+        };
+        es.onerror = () => { es.close(); reject(new Error("Connection lost during processing")); };
+      });
+
+      // Step 3: Fetch the finished zip
+      const resultRes = await fetch(`${Backend}/api/result/${jobId}`);
+      if (!resultRes.ok) throw new Error("Failed to download result");
+      setExcelBlob(await resultRes.blob());
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Something went wrong";
+      alert(msg);
     } finally {
       setLoading(false);
+      setProgress(null);
     }
   };
 
@@ -52,6 +78,36 @@ function ImageUpload() {
     a.remove();
     window.URL.revokeObjectURL(url);
   };
+
+  if (loading && progress) {
+    const pct = progress.total > 0 ? Math.round((progress.processed / progress.total) * 100) : 0;
+    return (
+      <div className="fixed inset-0 z-[9999] bg-black/60 flex items-center justify-center">
+        <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-8 w-full max-w-sm mx-4 flex flex-col items-center gap-5">
+          <div className="h-12 w-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
+          <div className="text-center">
+            <p className="text-gray-900 dark:text-white font-semibold text-base">Processing Images</p>
+            <p className="text-gray-500 dark:text-gray-400 text-sm mt-1">
+              {progress.processed} / {progress.total} images processed
+            </p>
+          </div>
+          <div className="w-full">
+            <div className="flex justify-between text-xs text-gray-400 dark:text-gray-500 mb-1.5">
+              <span>Progress</span>
+              <span className="font-semibold text-gray-700 dark:text-white/80">{pct}%</span>
+            </div>
+            <div className="h-2.5 bg-gray-200 dark:bg-white/10 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-blue-500 to-violet-500 rounded-full transition-all duration-500 ease-out"
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+          </div>
+          <p className="text-xs text-gray-400 dark:text-gray-500 text-center">Please don't close this tab</p>
+        </div>
+      </div>
+    );
+  }
 
   if (loading) return <Loader />;
 

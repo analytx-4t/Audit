@@ -55,7 +55,7 @@ function UploadCard({ title, subtitle, accentColor, fileState, onFileSelect, onU
     e.preventDefault();
     setIsDragging(false);
     const file = e.dataTransfer.files[0];
-    if (file && (file.name.endsWith(".xls") || file.name.endsWith(".xlsx"))) onFileSelect(file);
+    if (file && (file.name.endsWith(".xls") || file.name.endsWith(".xlsx") || file.name.endsWith(".csv"))) onFileSelect(file);
   }, [onFileSelect]);
 
   return (
@@ -76,7 +76,7 @@ function UploadCard({ title, subtitle, accentColor, fileState, onFileSelect, onU
             <p className="text-gray-400 dark:text-white/40 text-xs mt-0.5">{subtitle}</p>
           </div>
         </div>
-        <span className={`text-[10px] font-semibold px-2.5 py-1 rounded-full ${accent.badge}`}>.xls / .xlsx</span>
+        <span className={`text-[10px] font-semibold px-2.5 py-1 rounded-full ${accent.badge}`}>.xls / .xlsx / .csv</span>
       </div>
 
       <div
@@ -93,7 +93,7 @@ function UploadCard({ title, subtitle, accentColor, fileState, onFileSelect, onU
               : "border-gray-200 dark:border-white/10 hover:border-gray-300 dark:hover:border-white/20 hover:bg-gray-50 dark:hover:bg-white/[0.03]"
           }`}
       >
-        <input ref={inputRef} type="file" accept=".xls,.xlsx" className="hidden"
+        <input ref={inputRef} type="file" accept=".xls,.xlsx,.csv" className="hidden"
           onChange={(e) => { const f = e.target.files?.[0]; if (f) onFileSelect(f); }} />
 
         {!fileState.file && fileState.status === "idle" && (
@@ -105,7 +105,7 @@ function UploadCard({ title, subtitle, accentColor, fileState, onFileSelect, onU
               <p className="text-gray-700 dark:text-white/70 text-sm font-medium">
                 {isDragging ? "Drop your file here" : "Click to upload or drag & drop"}
               </p>
-              <p className="text-gray-400 dark:text-white/30 text-xs mt-1">Supports XLS and XLSX formats</p>
+              <p className="text-gray-400 dark:text-white/30 text-xs mt-1">Supports XLS, XLSX and CSV formats</p>
             </div>
           </div>
         )}
@@ -275,7 +275,7 @@ export default function ExcelUploadPage() {
         )}
 
         <p className="mt-6 text-center text-gray-400 dark:text-white/20 text-xs">
-          Supported formats: .xls, .xlsx · Max file size: 50MB per file
+          Supported formats: .xls, .xlsx, .csv · Max file size: 50MB per file
         </p>
       </main>
     </div>
