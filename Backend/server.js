@@ -33,7 +33,8 @@ app.use(
 app.use(morgan("dev"));
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.DEEPSEEK_API_KEY,
+  baseURL: "https://api.deepseek.com",
 });
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
@@ -44,7 +45,7 @@ async function extractVehicleDetailsWithAI(text) {
   // console.log("text", text);
 
   const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
+    model: "deepseek-chat",
     response_format: { type: "json_object" },
     messages: [
       {
