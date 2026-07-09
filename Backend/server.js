@@ -1013,9 +1013,12 @@ async function cropVehicleImageBuffer(file) {
       console.log(`[Cropping] No text detected for ${file.originalname}. Using the full working region.`);
     }
 
-    // Step 5: Crop the text region and convert to JPEG directly
+    // Step 5: Crop the text region, convert to black & white (grayscale), normalize contrast, sharpen, and export as JPEG
     const finalImageBuffer = await sharp(file.buffer)
       .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+      .greyscale()
+      .normalize()
+      .sharpen()
       .jpeg()
       .toBuffer();
 
