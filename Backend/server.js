@@ -12,6 +12,8 @@ import { Readable } from "stream";
 import archiver from "archiver";
 import crypto from "crypto";
 // import fs from "fs";
+import sharp from "sharp";
+import { createWorker } from "tesseract.js";
 
 config();
 const app = express();
@@ -871,9 +873,190 @@ async function runOcrStage(fileUrl, modelName, stageName, vehicleType = "") {
   return ocrResponse.data.pages?.[0]?.markdown || "";
 }
 
+async function cropVehicleImageBuffer(file) {
+  const isImage = file.mimetype && file.mimetype.startsWith("image/");
+  if (!isImage) {
+    console.log(`[Cropping] Skipping non-image file: ${file.originalname}`);
+    return file.buffer;
+  }
+
+  console.log(`[Cropping] Processing image file: ${file.originalname}`);
+  try {
+    const image = sharp(file.buffer);
+    const metadata = await image.metadata();
+    const width = metadata.width;
+    const height = metadata.height;
+
+    // Step 1: Divide image into Working Region (top 75%) and Watermark Region (bottom 25%)
+    const workingHeight = Math.round(height * 0.75);
+    const watermarkHeight = height - workingHeight;
+
+    const workingBuffer = await image
+      .clone()
+      .extract({ left: 0, top: 0, width: width, height: workingHeight })
+      .toBuffer();
+
+    // Step 2: Create preprocessed buffer for OCR (grayscale + normalize + sharpen)
+    const preprocessedBuffer = await sharp(workingBuffer)
+      .greyscale()
+      .normalize()
+      .sharpen()
+      .toBuffer();
+
+    // Step 3: Run horizontal and vertical text detection using Tesseract v7
+    const worker = await createWorker('eng');
+    const { data: horizontalData } = await worker.recognize(preprocessedBuffer, {}, { blocks: true });
+    await worker.terminate();
+
+    const horizontalWords = [];
+    if (horizontalData && horizontalData.blocks) {
+      for (const block of horizontalData.blocks) {
+        if (block.paragraphs) {
+          for (const para of block.paragraphs) {
+            if (para.lines) {
+              for (const line of para.lines) {
+                if (line.words) {
+                  horizontalWords.push(...line.words);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const rotatedBuffer = await sharp(preprocessedBuffer)
+      .rotate(90)
+      .toBuffer();
+
+    const workerRot = await createWorker('eng');
+    const { data: verticalData } = await workerRot.recognize(rotatedBuffer, {}, { blocks: true });
+    await workerRot.terminate();
+
+    const verticalWords = [];
+    if (verticalData && verticalData.blocks) {
+      for (const block of verticalData.blocks) {
+        if (block.paragraphs) {
+          for (const para of block.paragraphs) {
+            if (para.lines) {
+              for (const line of para.lines) {
+                if (line.words) {
+                  verticalWords.push(...line.words);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Step 4: Merge bounding boxes
+    let minX = width;
+    let minY = workingHeight;
+    let maxX = 0;
+    let maxY = 0;
+    let foundValidText = false;
+
+    // Filter rule (relaxed): length >= 2, confidence > 30%
+    const isValidWord = (word) => {
+      const cleanText = word.text.replace(/[^A-Za-z0-9]/g, '');
+      return cleanText.length >= 2 && word.confidence > 30;
+    };
+
+    horizontalWords.forEach(word => {
+      if (isValidWord(word)) {
+        const { x0, y0, x1, y1 } = word.bbox;
+        if (x0 < minX) minX = x0;
+        if (y0 < minY) minY = y0;
+        if (x1 > maxX) maxX = x1;
+        if (y1 > maxY) maxY = y1;
+        foundValidText = true;
+      }
+    });
+
+    verticalWords.forEach(word => {
+      if (isValidWord(word)) {
+        const { x0: rx0, y0: ry0, x1: rx1, y1: ry1 } = word.bbox;
+        
+        // Map back to original coordinate system
+        const x0 = width - ry1;
+        const x1 = width - ry0;
+        const y0 = rx0;
+        const y1 = rx1;
+
+        if (x0 < minX) minX = x0;
+        if (y0 < minY) minY = y0;
+        if (x1 > maxX) maxX = x1;
+        if (y1 > maxY) maxY = y1;
+        foundValidText = true;
+      }
+    });
+
+    let cropX, cropY, cropW, cropH;
+
+    if (foundValidText) {
+      const padding = 80;
+      cropX = Math.max(0, minX - padding);
+      cropY = Math.max(0, minY - padding);
+      cropW = Math.min(width - cropX, (maxX - minX) + (padding * 2));
+      cropH = Math.min(workingHeight - cropY, (maxY - minY) + (padding * 2));
+      console.log(`[Cropping] Calculated text bounding box for ${file.originalname}: Left: ${cropX}, Top: ${cropY}, Width: ${cropW}, Height: ${cropH}`);
+    } else {
+      cropX = 0;
+      cropY = 0;
+      cropW = width;
+      cropH = workingHeight;
+      console.log(`[Cropping] No text detected for ${file.originalname}. Using the full working region.`);
+    }
+
+    // Step 5: Crop the text region
+    const croppedTextBuffer = await sharp(file.buffer)
+      .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+      .toBuffer();
+
+    // Step 6: Crop the GPS watermark region (full width of original image)
+    const watermarkBuffer = await sharp(file.buffer)
+      .extract({ left: 0, top: workingHeight, width: width, height: watermarkHeight })
+      .toBuffer();
+
+    // Step 7: Combine cropped text and watermark vertically
+    const compositeHeight = cropH + watermarkHeight;
+
+    const finalImageBuffer = await sharp({
+      create: {
+        width: width,
+        height: compositeHeight,
+        channels: 3,
+        background: { r: 0, g: 0, b: 0 } // Black padding background
+      }
+    })
+    .composite([
+      { input: croppedTextBuffer, top: 0, left: Math.round((width - cropW) / 2) }, // Centered text at top
+      { input: watermarkBuffer, top: cropH, left: 0 }                           // Watermark at bottom
+    ])
+    .jpeg()
+    .toBuffer();
+
+    console.log(`[Cropping] Successfully cropped and composited image: ${file.originalname}`);
+    return finalImageBuffer;
+
+  } catch (err) {
+    console.error(`[Cropping] Error cropping ${file.originalname}:`, err.message);
+    return file.buffer; // Fall back to original file buffer in case of any processing error
+  }
+}
+
 async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "") {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      if (attempt === 1) {
+        try {
+          const croppedBuffer = await cropVehicleImageBuffer(file);
+          file.buffer = croppedBuffer;
+        } catch (cropErr) {
+          console.error(`[Cropping] Failed to crop file ${file.originalname}:`, cropErr.message);
+        }
+      }
       const fileUrl = await uploadFileToMistral(file);
       const promptBundle = getVehiclePromptBundle(vehicleType);
       const stages = [
