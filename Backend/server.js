@@ -38,122 +38,757 @@ const openai = new OpenAI({
 });
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
+const OCR_3_MODEL = process.env.MISTRAL_OCR_3_MODEL || "mistral-ocr-latest";
+const OCR_4_MODEL = process.env.MISTRAL_OCR_4_MODEL || "mistral-ocr-latest";
 
+function normalizeVehicleType(vehicleType = "") {
+  const normalized = (vehicleType || "").toString().trim().toLowerCase();
+  if (normalized.includes("2")) return "two_wheeler";
+  if (normalized.includes("4")) return "four_wheeler";
+  if (normalized.includes("commercial equipment")) return "commercial_equipment";
+  if (normalized.includes("commercial vehicle")) return "commercial_vehicle";
+  return "general";
+}
 
-// this is good
-async function extractVehicleDetailsWithAI(text) {
-  // console.log("text", text);
+function getVehiclePromptBundle(vehicleType = "") {
+  const normalizedType = normalizeVehicleType(vehicleType);
+  const bundles = {
+    two_wheeler: {
+      key: "two_wheeler",
+      label: "2 Wheeler",
+      ocr3Prompt: `You are an OCR extraction engine specialized in Indian two-wheelers.
 
-  const response = await openai.chat.completions.create({
-    model: "deepseek-chat",
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content: `
-Extract the following details from invoice text and return ONLY JSON:
+Your task is to extract exactly three fields from the image.
 
+Step 1
+Locate the manufacturer identification sticker, chassis sticker, engraved frame VIN, or manufacturer plate.
+
+Step 2
+Extract:
+
+• VIN Number
+• Engine Number (only if explicitly written)
+• Fuel Type
+
+VIN Rules
+
+- VIN is usually a 17-character uppercase alphanumeric identifier.
+- Read every visible character carefully.
+- Preserve the exact sequence.
+- Never replace uncertain characters.
+- Never infer hidden characters.
+- If any VIN character cannot be confidently read, return an empty string.
+
+Engine Number Rules
+
+Extract ONLY when an explicit field such as
+
+ENGINE NO
+ENGINE NUMBER
+ENG NO
+
+exists.
+
+Do not derive the engine number from any other identifier.
+
+Fuel Rules
+
+Normalize to one of
+
+PETROL
+DIESEL
+CNG
+LPG
+ELECTRIC
+
+Examples
+
+1CNG → CNG
+
+Ignore every other field.
+
+Return ONLY
+
+{
+  "vin_number":"",
+  "engine_number":"",
+  "fuel_type":""
+}`,
+      ocr4Prompt: `You are performing a second-pass OCR inspection on a two-wheeler image.
+
+The previous OCR may have missed important fields.
+
+Search the image methodically.
+
+Search Order
+
+1. Manufacturer sticker
+2. White label
+3. Chassis engraving
+4. Frame tube
+5. QR sticker area
+6. Rotated text
+7. Vertical text
+
+Required fields
+
+VIN Number
+
+Engine Number (explicitly written only)
+
+Fuel Type
+
+VIN may
+
+• be vertical
+• be engraved
+• be rotated
+• be beside a QR code
+• be partially faded
+
+Read the complete VIN before returning.
+
+Do not stop after the first candidate.
+
+If multiple VIN-like strings exist, choose the one explicitly associated with VIN or chassis.
+
+Engine Number
+
+Return only when explicitly labelled.
+
+Fuel
+
+Return
+
+PETROL
+
+DIESEL
+
+CNG
+
+LPG
+
+ELECTRIC
+
+Output
+
+{
+"vin_number":"",
+"engine_number":"",
+"fuel_type":""
+}`,
+      llmPrompt: `You are validating OCR results using visual reasoning.
+
+The OCR system was unable to confidently extract one or more required fields.
+
+Inspect the entire image carefully.
+
+Reason internally about
+
+• manufacturer labels
+• frame engraving
+• sticker layout
+• text alignment
+
+Locate
+
+VIN Number
+
+Engine Number (explicitly labelled)
+
+Fuel Type
+
+Rules
+
+Never guess hidden characters.
+
+Never complete a partial VIN.
+
+Never invent an engine number.
+
+If confidence is insufficient, return an empty string.
+
+Return only
+
+{
+"vin_number":"",
+"engine_number":"",
+"fuel_type":""
+}`,
+      schema: {
+        type: "object",
+        properties: {
+          vin: { type: "string" },
+          engine_number: { type: "string" },
+          fuel_type: { type: "string" },
+        },
+        required: ["vin", "engine_number", "fuel_type"],
+      },
+    },
+    four_wheeler: {
+      key: "four_wheeler",
+      label: "4 Wheeler",
+      ocr3Prompt: `You are an OCR extraction engine for Indian passenger vehicles.
+
+Locate the factory identification sticker.
+
+Extract
+
+VIN Number
+
+Engine Number (only if explicitly written)
+
+Fuel Type
+
+VIN usually follows
+
+VIN:
+
+Fuel usually appears as
+
+PETROL
+
+DIESEL
+
+CNG
+
+LPG
+
+EV
+
+Normalize
+
+1CNG → CNG
+
+Rules
+
+Return the VIN exactly as printed.
+
+Never reconstruct missing characters.
+
+Never use barcode values.
+
+Ignore every other identifier.
+
+Return
+
+{
+"vin_number":"",
+"engine_number":"",
+"fuel_type":""
+}`,
+      ocr4Prompt: `You are performing an exhaustive OCR inspection.
+
+The VIN may be
+
+• covered by a barcode
+• split across two lines
+• printed vertically
+• partially faded
+• near glass markings
+
+Inspect the complete manufacturer sticker before answering.
+
+Required
+
+VIN Number
+
+Engine Number (explicit only)
+
+Fuel Type
+
+If multiple serial numbers exist
+
+Prefer the value explicitly associated with
+
+VIN
+
+Ignore
+
+PIO
+
+SPEC
+
+Body Number
+
+Barcode
+
+QR
+
+Dealer Sticker
+
+Return
+
+{
+"vin_number":"",
+"engine_number":"",
+"fuel_type":""
+}`,
+      llmPrompt: `You are the final visual verification model.
+
+Previous OCR passes were unable to confidently identify
+
+VIN
+
+Engine Number
+
+Fuel Type
+
+Inspect the complete sticker visually.
+
+Focus on
+
+VIN field
+
+Fuel field
+
+Engine Number field
+
+Never use unrelated serial numbers.
+
+Never infer hidden VIN characters.
+
+Return empty strings for uncertain values.
+
+Return only JSON.`,
+      schema: {
+        type: "object",
+        properties: {
+          vin: { type: "string" },
+          engine_number: { type: "string" },
+          fuel_type: { type: "string" },
+        },
+        required: ["vin", "engine_number", "fuel_type"],
+      },
+    },
+    commercial_equipment: {
+      key: "commercial_equipment",
+      label: "Commercial Equipment",
+      ocr3Prompt: `You are extracting identification data from commercial equipment.
+
+Required
+
+VIN Number
+
+Engine Number
+
+Fuel Type
+
+Locate the manufacturer identification plate.
+
+Read only fields explicitly labelled
+
+VIN
+
+ENGINE NO
+
+ENGINE NUMBER
+
+FUEL
+
+Ignore
+
+Model
+
+Approval Numbers
+
+Weights
+
+Ratings
+
+Return
+
+{
+"vin_number":"",
+"engine_number":"",
+"fuel_type":""
+}`,
+      ocr4Prompt: `Perform a complete inspection of the manufacturer plate.
+
+Inspect engraved text.
+
+Inspect faded regions.
+
+Inspect rotated labels.
+
+Locate
+
+VIN
+
+Engine Number
+
+Fuel Type
+
+Return only values that can be confidently read.
+
+Otherwise return empty strings.
+
+Output JSON only.`,
+      llmPrompt: `Visually inspect the identification plate.
+
+Recover
+
+VIN
+
+Engine Number
+
+Fuel Type
+
+Do not infer hidden characters.
+
+Only return values with high confidence.
+
+Return JSON.`,
+      schema: {
+        type: "object",
+        properties: {
+          vin: { type: "string" },
+          engine_number: { type: "string" },
+          fuel_type: { type: "string" },
+        },
+        required: ["vin", "engine_number", "fuel_type"],
+      },
+    },
+    commercial_vehicle: {
+      key: "commercial_vehicle",
+      label: "Commercial Vehicles",
+      ocr3Prompt: `You are an OCR engine specialized in commercial vehicle identification plates.
+
+Examples include
+
+Eicher
+
+Tata
+
+Ashok Leyland
+
+BharatBenz
+
+Mahindra
+
+Extract only
+
+VIN Number
+
+Engine Number
+
+Fuel Type
+
+Commercial plates contain many unrelated numbers.
+
+Ignore
+
+CMVR
+
+GVW
+
+GCW
+
+FAW
+
+RAW
+
+MFG YEAR
+
+MODEL
+
+Approval Number
+
+Weight Ratings
+
+Locate
+
+VIN
+
+ENGINE NO
+
+Fuel
+
+Return only
+
+{
+"vin_number":"",
+"engine_number":"",
+"fuel_type":""
+}`,
+      ocr4Prompt: `Perform an exhaustive inspection of the commercial vehicle plate.
+
+Search the complete plate before answering.
+
+VIN may be engraved with low contrast.
+
+Engine Number may be engraved below the manufacturing year.
+
+Fuel may appear separately.
+
+Ignore all weight values.
+
+Return only
+
+VIN
+
+Engine Number
+
+Fuel Type
+
+Return JSON.`,
+      llmPrompt: `You are verifying a commercial vehicle manufacturer plate.
+
+OCR was unable to confidently extract the required information.
+
+Visually inspect the plate.
+
+Locate
+
+VIN
+
+Engine Number
+
+Fuel Type
+
+Never confuse
+
+CMVR
+
+Weight
+
+Model
+
+Approval Number
+
+with VIN.
+
+Return empty strings when uncertain.
+
+Return only JSON.`,
+      schema: {
+        type: "object",
+        properties: {
+          vin: { type: "string" },
+          engine_number: { type: "string" },
+          fuel_type: { type: "string" },
+        },
+        required: ["vin", "engine_number", "fuel_type"],
+      },
+    },
+    general: {
+      key: "general",
+      label: "General",
+      ocr3Prompt: `TODO: Add OCR 3 prompt for general vehicle documents here.`,
+      ocr4Prompt: `TODO: Add OCR 4 prompt for general vehicle documents here.`,
+      llmPrompt: `TODO: Add LLM fallback prompt for general vehicle documents here.`,
+      schema: {
+        type: "object",
+        properties: {
+          vin: { type: "string" },
+          engine_number: { type: "string" },
+          fuel_type: { type: "string" },
+        },
+        required: ["vin", "engine_number", "fuel_type"],
+      },
+    },
+  };
+
+  return bundles[normalizedType] || bundles.general;
+}
+
+function extractVehicleDetailsFromText(text = "", vehicleType = "") {
+  const result = {
+    vin: "",
+    engine_number: "",
+    hmil: "",
+    invoice_number: "",
+    invoice_date: "",
+    grand_total: "",
+    hyp_hps: "",
+    tag: "audit_image",
+    fuel_type: "",
+    city: "",
+    state: "",
+    country: "",
+  };
+
+  const content = text || "";
+  const vinMatches = content.match(/\b[A-Za-z0-9]{17}\b/g) || [];
+  if (vinMatches.length > 0) {
+    result.vin = vinMatches[0].toUpperCase();
+  }
+
+  const hmilMatch = content.match(/\b[A-Za-z0-9]{17}\b/g) || [];
+  if (hmilMatch.length > 1) {
+    result.hmil = hmilMatch[1]?.toUpperCase() || "";
+  }
+
+  const engineMatch = content.match(/engine(?:\s*number|\s*no\.?|\s*no)?\s*[:#-]?\s*([A-Za-z0-9\-\/\s]{2,30})/i);
+  if (engineMatch && engineMatch[1]) {
+    result.engine_number = engineMatch[1].trim().replace(/\s+/g, " ");
+  }
+
+  const invoiceNumberMatch = content.match(/invoice\s*(?:no\.?|number)\s*[:#-]?\s*([A-Za-z0-9\-\/]{2,30})/i);
+  if (invoiceNumberMatch && invoiceNumberMatch[1]) {
+    result.invoice_number = invoiceNumberMatch[1].trim();
+  }
+
+  const invoiceDateMatch = content.match(/invoice\s*date\s*[:#-]?\s*([0-9]{1,2}[\/.\-][0-9]{1,2}[\/.\-][0-9]{2,4})/i);
+  if (invoiceDateMatch && invoiceDateMatch[1]) {
+    result.invoice_date = invoiceDateMatch[1].trim();
+  }
+
+  const grandTotalMatch = content.match(/grand\s+total[^0-9]*([0-9,\.]+)/i) || content.match(/total[^0-9]*([0-9,\.]+)/i);
+  if (grandTotalMatch && grandTotalMatch[1]) {
+    result.grand_total = grandTotalMatch[1].replace(/,/g, "");
+  }
+
+  if (/dispatch from/i.test(content) && /dispatch to/i.test(content) && /bill to/i.test(content) && /ship to/i.test(content)) {
+    result.tag = "purchase";
+  } else if (/delivery note/i.test(content) || /dispatch doc no/i.test(content)) {
+    result.tag = "sale";
+  }
+
+  const fuelTypeMatch = content.match(/\b(petrol|diesel|cng|electric|ev|hybrid)\b/i);
+  if (fuelTypeMatch && fuelTypeMatch[1]) {
+    result.fuel_type = fuelTypeMatch[1].toLowerCase();
+  }
+
+  if (vehicleType) {
+    result.tag = result.tag === "audit_image" ? "audit_image" : result.tag;
+  }
+
+  if (!result.vin && result.hmil) {
+    result.vin = result.hmil;
+  }
+
+  return result;
+}
+
+function isExtractionSuccessful(result = {}) {
+  const vin = String(result.vin || "").trim();
+  const engineNumber = String(result.engine_number || "").trim();
+  return Boolean(vin.length === 17 || engineNumber);
+}
+
+function normalizeOcrStructuredOutput(text = "") {
+  const candidate = (text || "").trim();
+  const result = {
+    vin: "",
+    engine_number: "",
+    fuel_type: "",
+  };
+
+  if (!candidate) return result;
+
+  try {
+    const jsonMatch = candidate.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      result.vin = parsed.vin_number || parsed.vin || "";
+      result.engine_number = parsed.engine_number || parsed.engineNo || parsed.engine || "";
+      result.fuel_type = parsed.fuel_type || parsed.fuel || "";
+      return result;
+    }
+  } catch (error) {
+    // fall back to regex-based extraction below
+  }
+
+  const vinMatch = candidate.match(/\b[A-Za-z0-9]{17}\b/);
+  if (vinMatch) result.vin = vinMatch[0].toUpperCase();
+
+  const engineMatch = candidate.match(/engine(?:\s*number|\s*no\.?|\s*no)?\s*[:#-]?\s*([A-Za-z0-9\-\/\s]{2,30})/i);
+  if (engineMatch && engineMatch[1]) result.engine_number = engineMatch[1].trim().replace(/\s+/g, " ");
+
+  const fuelMatch = candidate.match(/\b(petrol|diesel|cng|lpg|electric|ev)\b/i);
+  if (fuelMatch && fuelMatch[1]) result.fuel_type = fuelMatch[1].toLowerCase();
+
+  return result;
+}
+
+async function extractVehicleDetailsWithAI(text, vehicleType = "") {
+  const promptBundle = getVehiclePromptBundle(vehicleType);
+  const vehicleContext = vehicleType ? `\nVehicle type context: ${promptBundle.label}. Use this context to interpret the document and extract the correct VIN-related details.\n` : "";
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "deepseek-chat",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `
+You are a fallback extraction model for vehicle documents.${vehicleContext}
+
+Return only the OCR-stage JSON shape with these fields:
 {
   "vin": "",
   "engine_number": "",
-  "hmil": "",
-  "invoice_number": "",
-  "invoice_date": "",
-  "grand_total": "",
-  "hyp_hps": "",
-  "tag": "",
-  "fuel_type": "",
-  "city": "",
-  "state": "",
-  "country": ""
+  "fuel_type": ""
 }
 
+Use this category-specific fallback prompt:
+${promptBundle.llmPrompt}
+
 Rules:
-- VIN must be 17 characters.
-- engine_number must match exactly.
-- hmil must be 17 characters.
-- If hmil is found and vin is empty, set vin = hmil.
-- Extract Grand Total: look for fields labeled "Grand Total", "Total", "Amount", or "₹" followed by a number. Extract the LARGEST final amount as a plain number only (no ₹ symbol, no commas). If multiple totals appear (subtotal, tax subtotal, grand total), always take the final grand total.
-- If text contains "HYP / HPA" or "HYP/HPA" or "HYP / HPS", extract ONLY the value after the colon. Example: "HYP / HPA: HDFC Bank Ltd" → extract "HDFC Bank Ltd" only.
-- If HYP/HPA label is NOT found but bank details section exists, extract the bank name value from "Bank Name :" or "Bank Name:" field. Extract only the bank name string as written, no prefix, no account numbers.
+- Return only valid JSON.
+- VIN should be 17 characters when present.
+- If no confident value exists, return an empty string.
+- Keep the other final-stage fields empty for later enrichment.
+          `,
+        },
+        {
+          role: "user",
+          content: text,
+        },
+      ],
+      temperature: 0,
+    });
 
-INVOICE NUMBER & DATE EXTRACTION:
-- Look for these label patterns (any of them):
-  * "Invoice No." or "Invoice No :" or "Invoice No:" → value after it
-  * "Invoice Number" → value after it
-  * "Invoice No. :" (with spaces) → value right after the colon
-- Invoice number can be numeric only (e.g. "250310015290") OR alphanumeric (e.g. "PH/2526/G/0525") — accept both formats.
+    const parsed = JSON.parse(response.choices[0].message.content || "{}");
+    const result = {
+      vin: parsed.vin || "",
+      engine_number: parsed.engine_number || "",
+      hmil: "",
+      invoice_number: "",
+      invoice_date: "",
+      grand_total: "",
+      hyp_hps: "",
+      tag: "audit_image",
+      fuel_type: parsed.fuel_type || "",
+      city: "",
+      state: "",
+      country: "",
+    };
 
-- For Invoice Date, look for these label patterns (any of them):
-  * "Invoice Date :" or "Invoice Date:" → value after it (e.g. "08.01.2026")
-  * "Dated" field in the invoice header table → value after it (e.g. "1-Jan-26", "16-Jan-26")
-  * Date formats can be: DD.MM.YYYY, DD-Mon-YY, DD/MM/YYYY — accept all.
-- Do NOT use "Ack Date" from the IRN/acknowledgement section at the top.
-
-TAG DETECTION for this document type:
-- If text contains "Despatch From" AND "Despatch To" AND "Bill to" AND "Ship to" → tag = "purchase" (this is a HMIL dispatch invoice).
-- If text contains "Delivery Note" OR "Dispatch Doc No" → tag = "sale".
-- Otherwise → tag = "audit_image".
-
-FUEL TYPE & VIN CONSTRUCTION:
-- Look for fuel type keywords: "petrol", "diesel", "cng", "electric", "ev", "hybrid" (case-insensitive).
-- Set fuel_type to the matched keyword in lowercase. If none found, set fuel_type to "".
-- Often the VIN is split across lines. The fuel type keyword (e.g. "PETROL" or "DIESEL") may appear between the partial VIN and the remaining digits. For example:
-    VIN: MALFB81BLSM
-    PETROL 699169
-  Here "MALFB81BLSM" is partial VIN and "699169" after PETROL/DIESEL is the remaining part.
-  Concatenate them to form the full 17-char VIN: "MALFB81BLSM699169".
-- The fuel type keyword itself (petrol/diesel etc.) is NOT part of the VIN. Only the numbers/alphanumeric characters around it are.
-- Final VIN should be exactly 17 alphanumeric characters with NO fuel type suffix.
-
-CRITICAL VIN DETECTION:
-- Scan the ENTIRE text for any 17-character alphanumeric string (letters and digits only, no spaces or special chars).
-- If you find any such 17-char alphanumeric string ANYWHERE in the text, treat it as the VIN.
-- This applies even if it is not labeled as "VIN" or "HMIL" — any standalone 17-char alphanumeric code is a VIN.
-- If multiple 17-char codes exist, prefer the one labeled VIN or HMIL. Otherwise use the first one found.
-- Ignore alphanumeric strings longer than 17 characters.
-- Do NOT trim longer strings to 17 characters.
-- Only consider exact 17-character strings as VIN.
-
-IMPORTANT: If the text contains only a single long alphanumeric code (typically 17 characters) and no invoice details, treat that code as the VIN. Set tag = "audit_image" and leave all other fields empty (except fuel_type if detected).
-
-CITY / STATE / COUNTRY EXTRACTION:
-- Look for address blocks in "Bill To", "Ship To", "Buyer", "Consignee", or any address section.
-- Extract the city name (e.g. "Mumbai", "Delhi", "Pune") into "city".
-- Extract the state name (e.g. "Maharashtra", "Karnataka") into "state".
-- Extract the country (e.g. "India") into "country". Default to "India" if an address is present but country is not explicitly stated.
-- If no address is found, leave all three as empty strings.
-
-Return only valid JSON.
-        `,
-      },
-      {
-        role: "user",
-        content: text,
-      },
-    ],
-    temperature: 0,
-  });
-
-  let result = JSON.parse(response.choices[0].message.content);
-
-  // FALLBACK: If AI didn't find VIN, use regex to find any 17-char alphanumeric string
-  if (!result.vin || result.vin.length !== 17) {
-    const matches = text.match(/\b[A-Za-z0-9]{17}\b/g);
-    if (matches && matches.length > 0) {
-      result.vin = matches[0].toUpperCase();
-      console.log("Fallback VIN found via regex:", result.vin);
+    if (!isExtractionSuccessful(result)) {
+      const regexResult = extractVehicleDetailsFromText(text, vehicleType);
+      return {
+        ...regexResult,
+        ...result,
+        vin: result.vin || regexResult.vin || "",
+        engine_number: result.engine_number || regexResult.engine_number || "",
+        fuel_type: result.fuel_type || regexResult.fuel_type || "",
+      };
     }
+
+    if (result.vin) {
+      result.vin = result.vin.toUpperCase();
+    }
+
+    return result;
+  } catch (error) {
+    console.error("LLM fallback extraction failed:", error.message);
+    const regexResult = extractVehicleDetailsFromText(text, vehicleType);
+    return {
+      ...regexResult,
+      hmil: "",
+      invoice_number: "",
+      invoice_date: "",
+      grand_total: "",
+      hyp_hps: "",
+      tag: "audit_image",
+      city: "",
+      state: "",
+      country: "",
+    };
   }
-
-  // Ensure VIN is always uppercase
-  if (result.vin) {
-    result.vin = result.vin.toUpperCase();
-  }
-
-  
-
-  return result;
 }
 
 
@@ -182,66 +817,121 @@ const MAX_RETRIES = 3;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─── HELPER: upload + OCR one file (with retry) ───────────
-async function processOneFile(file, retries = MAX_RETRIES) {
+async function uploadFileToMistral(file) {
+  const formData = new FormData();
+  formData.append("file", file.buffer, {
+    filename: file.originalname,
+    contentType: file.mimetype,
+  });
+  formData.append("purpose", "ocr");
+
+  const uploadResponse = await axios.post(
+    "https://api.mistral.ai/v1/files",
+    formData,
+    {
+      headers: {
+        ...formData.getHeaders(),
+        Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    }
+  );
+
+  const fileId = uploadResponse.data.id;
+  const urlResponse = await axios.get(
+    `https://api.mistral.ai/v1/files/${fileId}/url`,
+    { headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` } }
+  );
+
+  return urlResponse.data.url;
+}
+
+async function runOcrStage(fileUrl, modelName, stageName, vehicleType = "") {
+  const promptBundle = getVehiclePromptBundle(vehicleType);
+  const promptText = stageName === "ocr3" ? promptBundle.ocr3Prompt : promptBundle.ocr4Prompt;
+  console.log(`[${stageName}] Using ${modelName} for ${promptBundle.label}`);
+  // TODO: inject your vehicle-specific OCR prompt and JSON schema here for the selected Mistral OCR model.
+  console.log(`[${stageName}] Prompt placeholder: ${promptText}`);
+
+  const ocrResponse = await axios.post(
+    "https://api.mistral.ai/v1/ocr",
+    {
+      model: modelName,
+      document: { type: "document_url", document_url: fileUrl },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${MISTRAL_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  return ocrResponse.data.pages?.[0]?.markdown || "";
+}
+
+async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "") {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      // STEP 1: Upload to Mistral
-      const formData = new FormData();
-      formData.append("file", file.buffer, {
-        filename: file.originalname,
-        contentType: file.mimetype,
-      });
-      formData.append("purpose", "ocr");
+      const fileUrl = await uploadFileToMistral(file);
+      const promptBundle = getVehiclePromptBundle(vehicleType);
+      const stages = [
+        { name: "ocr3", model: OCR_3_MODEL },
+        { name: "ocr4", model: OCR_4_MODEL },
+      ];
 
-      const uploadResponse = await axios.post(
-        "https://api.mistral.ai/v1/files",
-        formData,
-        {
-          headers: {
-            ...formData.getHeaders(),
-            Authorization: `Bearer ${MISTRAL_API_KEY}`,
-          },
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity,
+      let lastOcrText = "";
+      for (const stage of stages) {
+        const ocrText = await runOcrStage(fileUrl, stage.model, stage.name, vehicleType);
+        lastOcrText = ocrText;
+
+        const stageResult = normalizeOcrStructuredOutput(ocrText);
+        if (isExtractionSuccessful(stageResult)) {
+          const finalResult = {
+            vin: stageResult.vin || "",
+            engine_number: stageResult.engine_number || "",
+            hmil: "",
+            invoice_number: "",
+            invoice_date: "",
+            grand_total: "",
+            hyp_hps: "",
+            tag: "audit_image",
+            fuel_type: stageResult.fuel_type || "",
+            city: "",
+            state: "",
+            country: "",
+          };
+          console.log(`[${file.originalname}] Extraction succeeded with ${stage.name} for ${promptBundle.label}`);
+          return { file, aiResult: finalResult, success: true, source: stage.name };
         }
-      );
+      }
 
-      const fileId = uploadResponse.data.id;
-
-      // STEP 2: Get Signed URL
-      const urlResponse = await axios.get(
-        `https://api.mistral.ai/v1/files/${fileId}/url`,
-        { headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` } }
-      );
-
-      const fileUrl = urlResponse.data.url;
-
-      // STEP 3: OCR
-      const ocrResponse = await axios.post(
-        "https://api.mistral.ai/v1/ocr",
-        {
-          model: "mistral-ocr-latest",
-          document: { type: "document_url", document_url: fileUrl },
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${MISTRAL_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-        }
-      );
-
-      const ocrText = ocrResponse.data.pages?.[0]?.markdown || "";
-
-      // STEP 4: AI Extraction
-      const aiResult = await extractVehicleDetailsWithAI(ocrText);
-
-      return { file, aiResult, success: true };
+      const llmResult = await extractVehicleDetailsWithAI(lastOcrText, vehicleType);
+      const finalResult = isExtractionSuccessful(llmResult) ? llmResult : {
+        vin: "",
+        engine_number: "",
+        hmil: "",
+        invoice_number: "",
+        invoice_date: "",
+        grand_total: "",
+        hyp_hps: "",
+        tag: "audit_image",
+        fuel_type: "",
+        city: "",
+        state: "",
+        country: "",
+      };
+      return {
+        file,
+        aiResult: finalResult,
+        success: isExtractionSuccessful(finalResult),
+        source: isExtractionSuccessful(finalResult) ? "llm_fallback" : "failed",
+      };
     } catch (err) {
       const isLastAttempt = attempt === retries;
       const status = err.response?.status;
 
-      // Don't retry on overflow/payload errors
       if (status === 413 || status === 400) {
         console.error(`[${file.originalname}] Payload error, skipping.`);
         break;
@@ -250,7 +940,7 @@ async function processOneFile(file, retries = MAX_RETRIES) {
       if (isLastAttempt) {
         console.error(`[${file.originalname}] Failed after ${retries} attempts:`, err.message);
       } else {
-        const backoff = attempt * 2000; // 2s, 4s, 6s
+        const backoff = attempt * 2000;
         console.warn(`[${file.originalname}] Attempt ${attempt} failed. Retrying in ${backoff}ms...`);
         await sleep(backoff);
       }
@@ -261,7 +951,7 @@ async function processOneFile(file, retries = MAX_RETRIES) {
 }
 
 // ─── HELPER: run array in batches ─────────────────────────
-async function processBatches(files, onFileProcessed = () => {}) {
+async function processBatches(files, onFileProcessed = () => {}, vehicleType = "") {
   const allResults = [];
 
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
@@ -270,7 +960,7 @@ async function processBatches(files, onFileProcessed = () => {}) {
 
     const batchResults = await Promise.all(
       batch.map(async (f) => {
-        const result = await processOneFile(f);
+        const result = await processOneFile(f, MAX_RETRIES, vehicleType);
         onFileProcessed();
         return result;
       })
@@ -298,13 +988,14 @@ app.post("/api/extract", (req, res, next) => {
   });
 }, (req, res) => {
   const files = req.files;
+  const vehicleType = req.body.vehicle_type || req.body.vehicleType || "";
   if (!files || files.length === 0) {
     return res.status(400).json({ error: "No files uploaded" });
   }
   const jobId = crypto.randomUUID();
   jobStore.set(jobId, { status: "processing", total: files.length, processed: 0, result: null, error: null, clients: [] });
   res.json({ jobId, total: files.length });
-  runJob(jobId, files);
+  runJob(jobId, files, vehicleType);
 });
 
 // ─── SSE PROGRESS ─────────────────────────────────────────
@@ -341,7 +1032,7 @@ app.get("/api/result/:jobId", (req, res) => {
 });
 
 // ─── JOB RUNNER ───────────────────────────────────────────
-async function runJob(jobId, files) {
+async function runJob(jobId, files, vehicleType = "") {
   const job = jobStore.get(jobId);
   try {
     const failedFiles = [];
@@ -385,7 +1076,7 @@ async function runJob(jobId, files) {
       job.clients.forEach((send) => send(update));
     };
 
-    const allResults = await processBatches(files, notify);
+    const allResults = await processBatches(files, notify, vehicleType);
 
     for (const { file, aiResult, success } of allResults) {
       if (!success || !aiResult) { failedFiles.push(file); continue; }
