@@ -1013,35 +1013,13 @@ async function cropVehicleImageBuffer(file) {
       console.log(`[Cropping] No text detected for ${file.originalname}. Using the full working region.`);
     }
 
-    // Step 5: Crop the text region
-    const croppedTextBuffer = await sharp(file.buffer)
+    // Step 5: Crop the text region and convert to JPEG directly
+    const finalImageBuffer = await sharp(file.buffer)
       .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+      .jpeg()
       .toBuffer();
 
-    // Step 6: Crop the GPS watermark region (full width of original image)
-    const watermarkBuffer = await sharp(file.buffer)
-      .extract({ left: 0, top: workingHeight, width: width, height: watermarkHeight })
-      .toBuffer();
-
-    // Step 7: Combine cropped text and watermark vertically
-    const compositeHeight = cropH + watermarkHeight;
-
-    const finalImageBuffer = await sharp({
-      create: {
-        width: width,
-        height: compositeHeight,
-        channels: 3,
-        background: { r: 0, g: 0, b: 0 } // Black padding background
-      }
-    })
-    .composite([
-      { input: croppedTextBuffer, top: 0, left: Math.round((width - cropW) / 2) }, // Centered text at top
-      { input: watermarkBuffer, top: cropH, left: 0 }                           // Watermark at bottom
-    ])
-    .jpeg()
-    .toBuffer();
-
-    console.log(`[Cropping] Successfully cropped and composited image: ${file.originalname}`);
+    console.log(`[Cropping] Successfully cropped image: ${file.originalname}`);
     return finalImageBuffer;
 
   } catch (err) {
