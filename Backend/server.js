@@ -893,26 +893,39 @@ async function cropVehicleImageBuffer(file) {
 
     // Step 1: Divide image into Working Region (top 75%) and Watermark Region (bottom 25%)
     const workingHeight = Math.round(height * 0.75);
-    const watermarkHeight = height - workingHeight;
 
     const workingBuffer = await image
       .clone()
       .extract({ left: 0, top: 0, width: width, height: workingHeight })
       .toBuffer();
 
-    // Step 2: Create preprocessed buffer for OCR (grayscale + normalize + sharpen)
+    // Step 2: Upscale 2x and preprocess (grayscale + normalize + sharpen) to detect small text
     const preprocessedBuffer = await sharp(workingBuffer)
       .greyscale()
+      .resize(width * 2, workingHeight * 2, { kernel: sharp.kernel.lanczos3 })
       .normalize()
       .sharpen()
       .toBuffer();
 
-    // Step 3: Run horizontal and vertical text detection using Tesseract v7
-    const worker = await createWorker('eng');
-    const { data: horizontalData } = await worker.recognize(preprocessedBuffer, {}, { blocks: true });
-    await worker.terminate();
+    const isValidWord = (word) => {
+      const cleanText = word.text.replace(/[^A-Za-z0-9]/g, '');
+      return cleanText.length >= 2 && word.confidence > 30;
+    };
 
-    const horizontalWords = [];
+    let minX = width;
+    let minY = workingHeight;
+    let maxX = 0;
+    let maxY = 0;
+    let foundValidText = false;
+
+    // Step 3: Run horizontal and vertical text detection using Tesseract v7
+    
+    // Pass 1: Horizontal text (0 degrees)
+    console.log(`[Cropping] Running Pass 1 (Horizontal) for ${file.originalname}`);
+    const workerH = await createWorker('eng');
+    const { data: horizontalData } = await workerH.recognize(preprocessedBuffer, {}, { blocks: true });
+    await workerH.terminate();
+
     if (horizontalData && horizontalData.blocks) {
       for (const block of horizontalData.blocks) {
         if (block.paragraphs) {
@@ -920,7 +933,21 @@ async function cropVehicleImageBuffer(file) {
             if (para.lines) {
               for (const line of para.lines) {
                 if (line.words) {
-                  horizontalWords.push(...line.words);
+                  for (const word of line.words) {
+                    if (isValidWord(word)) {
+                      const { x0, y0, x1, y1 } = word.bbox;
+                      const origX0 = Math.round(x0 / 2);
+                      const origY0 = Math.round(y0 / 2);
+                      const origX1 = Math.round(x1 / 2);
+                      const origY1 = Math.round(y1 / 2);
+
+                      if (origX0 < minX) minX = origX0;
+                      if (origY0 < minY) minY = origY0;
+                      if (origX1 > maxX) maxX = origX1;
+                      if (origY1 > maxY) maxY = origY1;
+                      foundValidText = true;
+                    }
+                  }
                 }
               }
             }
@@ -929,23 +956,41 @@ async function cropVehicleImageBuffer(file) {
       }
     }
 
-    const rotatedBuffer = await sharp(preprocessedBuffer)
-      .rotate(90)
-      .toBuffer();
+    // Pass 2: Rotated 90 degrees clockwise
+    console.log(`[Cropping] Running Pass 2 (Rotated 90) for ${file.originalname}`);
+    const rotated90 = await sharp(preprocessedBuffer).rotate(90).toBuffer();
+    const workerRot90 = await createWorker('eng');
+    const { data: vert90Data } = await workerRot90.recognize(rotated90, {}, { blocks: true });
+    await workerRot90.terminate();
 
-    const workerRot = await createWorker('eng');
-    const { data: verticalData } = await workerRot.recognize(rotatedBuffer, {}, { blocks: true });
-    await workerRot.terminate();
-
-    const verticalWords = [];
-    if (verticalData && verticalData.blocks) {
-      for (const block of verticalData.blocks) {
+    if (vert90Data && vert90Data.blocks) {
+      for (const block of vert90Data.blocks) {
         if (block.paragraphs) {
           for (const para of block.paragraphs) {
             if (para.lines) {
               for (const line of para.lines) {
                 if (line.words) {
-                  verticalWords.push(...line.words);
+                  for (const word of line.words) {
+                    if (isValidWord(word)) {
+                      const { x0: rx0, y0: ry0, x1: rx1, y1: ry1 } = word.bbox;
+                      const origRx0 = rx0 / 2;
+                      const origRy0 = ry0 / 2;
+                      const origRx1 = rx1 / 2;
+                      const origRy1 = ry1 / 2;
+
+                      // Map back to original coordinate system
+                      const x0 = origRy0;
+                      const x1 = origRy1;
+                      const y0 = workingHeight - origRx1;
+                      const y1 = workingHeight - origRx0;
+
+                      if (x0 < minX) minX = x0;
+                      if (y0 < minY) minY = y0;
+                      if (x1 > maxX) maxX = x1;
+                      if (y1 > maxY) maxY = y1;
+                      foundValidText = true;
+                    }
+                  }
                 }
               }
             }
@@ -954,47 +999,48 @@ async function cropVehicleImageBuffer(file) {
       }
     }
 
-    // Step 4: Merge bounding boxes
-    let minX = width;
-    let minY = workingHeight;
-    let maxX = 0;
-    let maxY = 0;
-    let foundValidText = false;
+    // Pass 3: Rotated 270 degrees clockwise (90 degrees counter-clockwise)
+    console.log(`[Cropping] Running Pass 3 (Rotated 270) for ${file.originalname}`);
+    const rotated270 = await sharp(preprocessedBuffer).rotate(270).toBuffer();
+    const workerRot270 = await createWorker('eng');
+    const { data: vert270Data } = await workerRot270.recognize(rotated270, {}, { blocks: true });
+    await workerRot270.terminate();
 
-    // Filter rule (relaxed): length >= 2, confidence > 30%
-    const isValidWord = (word) => {
-      const cleanText = word.text.replace(/[^A-Za-z0-9]/g, '');
-      return cleanText.length >= 2 && word.confidence > 30;
-    };
+    if (vert270Data && vert270Data.blocks) {
+      for (const block of vert270Data.blocks) {
+        if (block.paragraphs) {
+          for (const para of block.paragraphs) {
+            if (para.lines) {
+              for (const line of para.lines) {
+                if (line.words) {
+                  for (const word of line.words) {
+                    if (isValidWord(word)) {
+                      const { x0: rx0, y0: ry0, x1: rx1, y1: ry1 } = word.bbox;
+                      const origRx0 = rx0 / 2;
+                      const origRy0 = ry0 / 2;
+                      const origRx1 = rx1 / 2;
+                      const origRy1 = ry1 / 2;
 
-    horizontalWords.forEach(word => {
-      if (isValidWord(word)) {
-        const { x0, y0, x1, y1 } = word.bbox;
-        if (x0 < minX) minX = x0;
-        if (y0 < minY) minY = y0;
-        if (x1 > maxX) maxX = x1;
-        if (y1 > maxY) maxY = y1;
-        foundValidText = true;
+                      // Map back to original coordinate system
+                      const x0 = width - origRy1;
+                      const x1 = width - origRy0;
+                      const y0 = origRx0;
+                      const y1 = origRx1;
+
+                      if (x0 < minX) minX = x0;
+                      if (y0 < minY) minY = y0;
+                      if (x1 > maxX) maxX = x1;
+                      if (y1 > maxY) maxY = y1;
+                      foundValidText = true;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
-    });
-
-    verticalWords.forEach(word => {
-      if (isValidWord(word)) {
-        const { x0: rx0, y0: ry0, x1: rx1, y1: ry1 } = word.bbox;
-        
-        // Map back to original coordinate system
-        const x0 = width - ry1;
-        const x1 = width - ry0;
-        const y0 = rx0;
-        const y1 = rx1;
-
-        if (x0 < minX) minX = x0;
-        if (y0 < minY) minY = y0;
-        if (x1 > maxX) maxX = x1;
-        if (y1 > maxY) maxY = y1;
-        foundValidText = true;
-      }
-    });
+    }
 
     let cropX, cropY, cropW, cropH;
 
@@ -1013,7 +1059,7 @@ async function cropVehicleImageBuffer(file) {
       console.log(`[Cropping] No text detected for ${file.originalname}. Using the full working region.`);
     }
 
-    // Step 5: Crop the text region, convert to black & white (grayscale), normalize contrast, sharpen, and export as JPEG
+    // Step 4: Crop the text region, convert to black & white (grayscale), normalize contrast, sharpen, and export as JPEG
     const finalImageBuffer = await sharp(file.buffer)
       .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
       .greyscale()
