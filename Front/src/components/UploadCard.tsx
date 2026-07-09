@@ -9,9 +9,13 @@ interface UploadCardProps {
   accentColor: "blue" | "violet" | "rose" | "emerald" | "amber";
   types: ("image" | "excel" | "pdf" | "any")[];
   onFilesChange?: (files: File[]) => void;
+  showVehicleSelector?: boolean;
+  vehicleOptions?: { value: string; label: string }[];
+  selectedVehicleType?: string;
+  onVehicleTypeChange?: (value: string) => void;
 }
 
-function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesChange }: UploadCardProps) {
+function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesChange, showVehicleSelector = false, vehicleOptions = [], selectedVehicleType, onVehicleTypeChange }: UploadCardProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -130,12 +134,12 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
 
   return (
     <>
-      <div className={`relative flex flex-col rounded-2xl
+      <div className={`relative flex flex-col h-full rounded-2xl
         border border-gray-200 dark:border-white/[0.07]
         bg-white dark:bg-white/[0.04]
         p-6 shadow-sm hover:shadow-md dark:hover:shadow-lg
         ring-4 ring-transparent ${accent.hoverRing}
-        transition-all duration-300`}>
+        transition-all duration-300 min-h-[360px]`}>
 
         {/* Header */}
         <div className="flex items-start justify-between mb-5">
@@ -160,7 +164,7 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
         {selectedFiles.length > 0 ? (
           <div
             onClick={() => setShowPreview(true)}
-            className={`rounded-xl border-2 ${accent.successBorder} ${accent.successBg} p-4 cursor-pointer hover:opacity-80 transition min-h-[140px] flex flex-col justify-center`}
+            className={`rounded-xl border-2 ${accent.successBorder} ${accent.successBg} p-4 cursor-pointer hover:opacity-80 transition min-h-[220px] flex-1 flex flex-col justify-center`}
           >
             <div className="flex items-center gap-3 mb-3">
               <div className={`flex items-center justify-center w-9 h-9 rounded-lg ${accent.iconBg}`}>
@@ -201,7 +205,7 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
               setIsDragging(false);
               if (e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files));
             }}
-            className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed min-h-[140px] cursor-pointer transition-all duration-200
+            className={`min-h-[220px] w-full flex-1 flex flex-col items-center justify-center rounded-xl border-2 border-dashed cursor-pointer transition-all duration-200
               ${isDragging
                 ? `${accent.dragBorder} ${accent.dragBg} scale-[1.01]`
                 : "border-gray-200 dark:border-white/10 hover:border-gray-300 dark:hover:border-white/20 hover:bg-gray-50 dark:hover:bg-white/[0.03]"}`}
@@ -228,10 +232,28 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
           }}
         />
 
+        {showVehicleSelector && vehicleOptions.length > 0 && (
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            {vehicleOptions.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => onVehicleTypeChange?.(option.value)}
+                className={`rounded-lg border px-3 py-2 text-sm font-medium transition ${selectedVehicleType === option.value
+                  ? "border-blue-500 bg-blue-50 text-blue-700 dark:border-blue-400 dark:bg-blue-500/20 dark:text-blue-300"
+                  : "border-gray-200 bg-white text-gray-700 hover:border-gray-300 hover:bg-gray-50 dark:border-white/10 dark:bg-white/5 dark:text-gray-200 dark:hover:bg-white/10"}`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* Vivid button - works in both light and dark */}
+        <div className="mt-4">
         <button
           onClick={() => fileInputRef.current?.click()}
-          className={`mt-4 flex items-center justify-center gap-2 w-full py-3 rounded-xl
+          className={`flex items-center justify-center gap-2 w-full py-3 rounded-xl
             text-sm font-semibold text-white
             ${accent.btnBg} shadow-lg ${accent.btnShadow}
             transition-all duration-150 active:scale-[0.98] hover:-translate-y-0.5 hover:shadow-xl`}
@@ -299,6 +321,7 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
           </div>
         </div>
       )}
+      </div>
     </>
   );
 }

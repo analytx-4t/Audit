@@ -4,16 +4,28 @@ import UploadCard from "./UploadCard";
 import ExcelUpload from "./ExcelUpload";
 import Loader from "./loader";
 
-const Backend = import.meta.env.VITE_BACKEND;
+const Backend = import.meta.env.VITE_BACKEND || "http://localhost:5000";
 
 function ImageUpload() {
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<{ processed: number; total: number } | null>(null);
   const [excelBlob, setExcelBlob] = useState<Blob | null>(null);
   const [filesMap, setFilesMap] = useState<Record<number, File[]>>({});
+  const [selectedVehicleType, setSelectedVehicleType] = useState("");
+  const [address, setAddress] = useState("");
+  const [city, setCity] = useState("");
+  const [state, setState] = useState("");
+  const [pincode, setPincode] = useState("");
+
+  const vehicleOptions = [
+    { value: "two_wheeler", label: "2 Wheeler" },
+    { value: "four_wheeler", label: "4 Wheeler" },
+    { value: "commercial_equipment", label: "Commercial Equipment" },
+    { value: "commercial_vehicle", label: "Commercial Vehicles" },
+  ];
 
   const imageCards = [
-    { id: 1, title: "2/4 Wheeler & Commercial Vehicle", subtitle: "2/4 Wheeler & Commercial Vehicle", icon: Monitor, accentColor: "blue" as const },
+    { id: 1, title: "Image Upload", subtitle: "Select the vehicle type and upload the sticker or plate image", icon: Monitor, accentColor: "blue" as const },
     { id: 2, title: "Sales / Insurance", subtitle: "Policy & sales documents", icon: FileText, accentColor: "violet" as const },
     { id: 3, title: "Purchase Invoice",  subtitle: "Transaction receipts",     icon: Receipt,  accentColor: "rose"   as const },
   ];
@@ -27,6 +39,10 @@ function ImageUpload() {
 
   const handleExtract = async () => {
     if (files.length === 0) return;
+    if (!selectedVehicleType) {
+      alert("Please select the vehicle type before extracting data.");
+      return;
+    }
     setLoading(true);
     setExcelBlob(null);
     setProgress(null);
@@ -34,6 +50,11 @@ function ImageUpload() {
       // Step 1: Upload files, receive a job ID immediately
       const formData = new FormData();
       files.forEach((file) => formData.append("files", file));
+      formData.append("vehicle_type", selectedVehicleType);
+      formData.append("address", address);
+      formData.append("city", city);
+      formData.append("state", state);
+      formData.append("pincode", pincode);
       const uploadRes = await fetch(`${Backend}/api/extract`, { method: "POST", body: formData });
       if (!uploadRes.ok) {
         const err = await uploadRes.json().catch(() => ({}));
@@ -167,8 +188,35 @@ function ImageUpload() {
               accentColor={card.accentColor}
               types={card.id === 1 ? ["image"] : ["image", "pdf", "excel", "any"]}
               onFilesChange={(cardFiles) => handleCardFiles(card.id, cardFiles)}
+              showVehicleSelector={card.id === 1}
+              vehicleOptions={vehicleOptions}
+              selectedVehicleType={selectedVehicleType}
+              onVehicleTypeChange={setSelectedVehicleType}
             />
           ))}
+        </div>
+
+        <div className="mb-8 rounded-2xl border border-gray-200/70 bg-white/80 p-5 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.04]">
+          <h2 className="text-sm font-semibold text-gray-800 dark:text-white/80">Address Details</h2>
+          <p className="mt-1 text-sm text-gray-500 dark:text-white/40">These details will be added to the extracted output.</p>
+          <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <label className="text-sm text-gray-600 dark:text-gray-300">
+              <span className="mb-1 block">Address</span>
+              <input value={address} onChange={(e) => setAddress(e.target.value)} className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm outline-none ring-0 focus:border-blue-500 dark:border-white/10 dark:bg-gray-900" placeholder="Enter address" />
+            </label>
+            <label className="text-sm text-gray-600 dark:text-gray-300">
+              <span className="mb-1 block">City</span>
+              <input value={city} onChange={(e) => setCity(e.target.value)} className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm outline-none ring-0 focus:border-blue-500 dark:border-white/10 dark:bg-gray-900" placeholder="Enter city" />
+            </label>
+            <label className="text-sm text-gray-600 dark:text-gray-300">
+              <span className="mb-1 block">State</span>
+              <input value={state} onChange={(e) => setState(e.target.value)} className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm outline-none ring-0 focus:border-blue-500 dark:border-white/10 dark:bg-gray-900" placeholder="Enter state" />
+            </label>
+            <label className="text-sm text-gray-600 dark:text-gray-300">
+              <span className="mb-1 block">Pincode</span>
+              <input value={pincode} onChange={(e) => setPincode(e.target.value)} className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm outline-none ring-0 focus:border-blue-500 dark:border-white/10 dark:bg-gray-900" placeholder="Enter pincode" />
+            </label>
+          </div>
         </div>
 
         {(files.length > 0 || excelBlob) && (
@@ -176,8 +224,8 @@ function ImageUpload() {
             {files.length > 0 && (
               <button
                 onClick={handleExtract}
-                disabled={loading}
-                style={{ opacity: loading ? 0.7 : 1 }}
+                disabled={loading || !selectedVehicleType || files.length === 0}
+                style={{ opacity: loading || !selectedVehicleType || files.length === 0 ? 0.7 : 1 }}
                 className="flex items-center gap-2 px-6 py-3 rounded-xl
                   bg-blue-500 hover:bg-blue-400
                   text-white text-sm font-semibold

@@ -41,7 +41,7 @@ const openai = new OpenAI({
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 const OCR_3_MODEL = process.env.MISTRAL_OCR_3_MODEL || "mistral-ocr-latest";
-const OCR_4_MODEL = process.env.MISTRAL_OCR_4_MODEL || "mistral-ocr-latest";
+const STICKER_ONLY_INSTRUCTION = "The input is a close-up image of a vehicle identification sticker or manufacturer plate. Ignore unrelated scene content, geotagged metadata, and any non-sticker text. Extract only the requested identification fields.";
 
 function normalizeVehicleType(vehicleType = "") {
   const normalized = (vehicleType || "").toString().trim().toLowerCase();
@@ -59,6 +59,8 @@ function getVehiclePromptBundle(vehicleType = "") {
       key: "two_wheeler",
       label: "2 Wheeler",
       ocr3Prompt: `You are an OCR extraction engine specialized in Indian two-wheelers.
+
+${STICKER_ONLY_INSTRUCTION}
 
 Your task is to extract exactly three fields from the image.
 
@@ -180,6 +182,8 @@ Output
 "fuel_type":""
 }`,
       llmPrompt: `You are validating OCR results using visual reasoning.
+
+${STICKER_ONLY_INSTRUCTION}
 
 The OCR system was unable to confidently extract one or more required fields.
 
@@ -576,9 +580,9 @@ Return only JSON.`,
     general: {
       key: "general",
       label: "General",
-      ocr3Prompt: `TODO: Add OCR 3 prompt for general vehicle documents here.`,
+      ocr3Prompt: `TODO: Add OCR 3 prompt for general vehicle documents here.\n\n${STICKER_ONLY_INSTRUCTION}`,
       ocr4Prompt: `TODO: Add OCR 4 prompt for general vehicle documents here.`,
-      llmPrompt: `TODO: Add LLM fallback prompt for general vehicle documents here.`,
+      llmPrompt: `TODO: Add LLM fallback prompt for general vehicle documents here.\n\n${STICKER_ONLY_INSTRUCTION}`,
       schema: {
         type: "object",
         properties: {
@@ -1046,7 +1050,7 @@ async function cropVehicleImageBuffer(file) {
   }
 }
 
-async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "") {
+async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "", addressDetails = {}) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       if (attempt === 1) {
@@ -1059,10 +1063,7 @@ async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "") {
       }
       const fileUrl = await uploadFileToMistral(file);
       const promptBundle = getVehiclePromptBundle(vehicleType);
-      const stages = [
-        { name: "ocr3", model: OCR_3_MODEL },
-        { name: "ocr4", model: OCR_4_MODEL },
-      ];
+      const stages = [{ name: "ocr3", model: OCR_3_MODEL }];
 
       let lastOcrText = "";
       for (const stage of stages) {
@@ -1081,8 +1082,10 @@ async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "") {
             hyp_hps: "",
             tag: "audit_image",
             fuel_type: stageResult.fuel_type || "",
-            city: "",
-            state: "",
+            address: addressDetails.address || "",
+            city: addressDetails.city || "",
+            state: addressDetails.state || "",
+            pincode: addressDetails.pincode || "",
             country: "",
           };
           console.log(`[${file.originalname}] Extraction succeeded with ${stage.name} for ${promptBundle.label}`);
@@ -1091,7 +1094,13 @@ async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "") {
       }
 
       const llmResult = await extractVehicleDetailsWithAI(lastOcrText, vehicleType);
-      const finalResult = isExtractionSuccessful(llmResult) ? llmResult : {
+      const finalResult = isExtractionSuccessful(llmResult) ? {
+        ...llmResult,
+        address: addressDetails.address || "",
+        city: addressDetails.city || llmResult.city || "",
+        state: addressDetails.state || llmResult.state || "",
+        pincode: addressDetails.pincode || "",
+      } : {
         vin: "",
         engine_number: "",
         hmil: "",
@@ -1101,8 +1110,10 @@ async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "") {
         hyp_hps: "",
         tag: "audit_image",
         fuel_type: "",
-        city: "",
-        state: "",
+        address: addressDetails.address || "",
+        city: addressDetails.city || "",
+        state: addressDetails.state || "",
+        pincode: addressDetails.pincode || "",
         country: "",
       };
       return {
@@ -1134,7 +1145,7 @@ async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "") {
 }
 
 // ─── HELPER: run array in batches ─────────────────────────
-async function processBatches(files, onFileProcessed = () => {}, vehicleType = "") {
+async function processBatches(files, onFileProcessed = () => {}, vehicleType = "", addressDetails = {}) {
   const allResults = [];
 
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
@@ -1143,7 +1154,24 @@ async function processBatches(files, onFileProcessed = () => {}, vehicleType = "
 
     const batchResults = await Promise.all(
       batch.map(async (f) => {
-        const result = await processOneFile(f, MAX_RETRIES, vehicleType);
+        const TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes per file
+        let timer;
+        const processingPromise = processOneFile(f, MAX_RETRIES, vehicleType, addressDetails).then((r) => {
+          clearTimeout(timer);
+          return r;
+        }).catch((err) => {
+          clearTimeout(timer);
+          throw err;
+        });
+
+        const timeoutPromise = new Promise((resolve) => {
+          timer = setTimeout(() => {
+            console.warn(`[Timeout] File ${f.originalname} exceeded ${TIMEOUT_MS}ms`);
+            resolve({ file: f, aiResult: { timeout: "timeout" }, success: false, source: "timeout" });
+          }, TIMEOUT_MS);
+        });
+
+        const result = await Promise.race([processingPromise, timeoutPromise]);
         onFileProcessed();
         return result;
       })
@@ -1172,13 +1200,19 @@ app.post("/api/extract", (req, res, next) => {
 }, (req, res) => {
   const files = req.files;
   const vehicleType = req.body.vehicle_type || req.body.vehicleType || "";
+  const addressDetails = {
+    address: req.body.address || "",
+    city: req.body.city || "",
+    state: req.body.state || "",
+    pincode: req.body.pincode || "",
+  };
   if (!files || files.length === 0) {
     return res.status(400).json({ error: "No files uploaded" });
   }
   const jobId = crypto.randomUUID();
   jobStore.set(jobId, { status: "processing", total: files.length, processed: 0, result: null, error: null, clients: [] });
   res.json({ jobId, total: files.length });
-  runJob(jobId, files, vehicleType);
+  runJob(jobId, files, vehicleType, addressDetails);
 });
 
 // ─── SSE PROGRESS ─────────────────────────────────────────
@@ -1215,7 +1249,7 @@ app.get("/api/result/:jobId", (req, res) => {
 });
 
 // ─── JOB RUNNER ───────────────────────────────────────────
-async function runJob(jobId, files, vehicleType = "") {
+async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
   const job = jobStore.get(jobId);
   try {
     const failedFiles = [];
@@ -1233,10 +1267,13 @@ async function runJob(jobId, files, vehicleType = "") {
       { header: "Invoice Date",   key: "invoice_date",     width: 14 },
       { header: "Grand Total",    key: "grand_total",      width: 14 },
       { header: "HYP/HPS",        key: "hyp_hps",          width: 10 },
+      { header: "Address",        key: "address",          width: 24 },
       { header: "City",           key: "city",             width: 14 },
       { header: "State",          key: "state",            width: 16 },
+      { header: "Pincode",        key: "pincode",          width: 12 },
       { header: "Country",        key: "country",          width: 12 },
       { header: "VIN Found",      key: "vin_found",        width: 12 },
+      { header: "Timeout",        key: "timeout",          width: 12 },
     ];
 
     const headerRow = worksheet.getRow(1);
@@ -1259,7 +1296,7 @@ async function runJob(jobId, files, vehicleType = "") {
       job.clients.forEach((send) => send(update));
     };
 
-    const allResults = await processBatches(files, notify, vehicleType);
+    const allResults = await processBatches(files, notify, vehicleType, addressDetails);
 
     for (const { file, aiResult, success } of allResults) {
       if (!success || !aiResult) { failedFiles.push(file); continue; }
@@ -1274,8 +1311,9 @@ async function runJob(jobId, files, vehicleType = "") {
       const dataRow = worksheet.addRow([
         file.originalname, aiResult.vin, aiResult.engine_number, aiResult.hmil,
         aiResult.tag, aiResult.invoice_number, aiResult.invoice_date, aiResult.grand_total,
-        aiResult.hyp_hps, aiResult.city, aiResult.state, aiResult.country,
+        aiResult.hyp_hps, aiResult.address || "", aiResult.city || "", aiResult.state || "", aiResult.pincode || "", aiResult.country || "",
         vinValid ? "Yes" : "Failed",
+        aiResult.timeout || "",
       ]);
 
       const isEven = dataRow.number % 2 === 0;
@@ -1541,7 +1579,15 @@ app.post(
 
       // Load Custom File
       if (customFile.mimetype === "text/csv") {
-        await customWorkbook.csv.read(Readable.from(customFile.buffer));
+    // capture address details if provided
+    const addressDetails = {
+      address: req.body.address || "",
+      city: req.body.city || "",
+      state: req.body.state || "",
+      pincode: req.body.pincode || "",
+    };
+    console.log('[Upload] Starting job', jobId, 'vehicleType=', vehicleType, 'address=', addressDetails);
+    runJob(jobId, files, vehicleType, addressDetails);
       } else {
         await customWorkbook.xlsx.load(customFile.buffer);
       }
