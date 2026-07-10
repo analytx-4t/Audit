@@ -45,10 +45,10 @@ const STICKER_ONLY_INSTRUCTION = "The input is a close-up image of a vehicle ide
 
 function normalizeVehicleType(vehicleType = "") {
   const normalized = (vehicleType || "").toString().trim().toLowerCase();
-  if (normalized.includes("2")) return "two_wheeler";
-  if (normalized.includes("4")) return "four_wheeler";
-  if (normalized.includes("commercial equipment")) return "commercial_equipment";
-  if (normalized.includes("commercial vehicle")) return "commercial_vehicle";
+  if (normalized.includes("2") || normalized.includes("two")) return "two_wheeler";
+  if (normalized.includes("4") || normalized.includes("four")) return "four_wheeler";
+  if (normalized.includes("commercial equipment") || normalized.includes("equipment")) return "commercial_equipment";
+  if (normalized.includes("commercial vehicle") || normalized.includes("commercial")) return "commercial_vehicle";
   return "general";
 }
 
@@ -708,6 +708,20 @@ function normalizeOcrStructuredOutput(text = "") {
   return result;
 }
 
+function cleanMarkdown(text) {
+  if (!text) return "";
+  let cleaned = text.replace(/!\[.*?\]\(.*?\)/gi, "");
+  cleaned = cleaned.replace(/\[.*?\]\(.*?\)/gi, "");
+  return cleaned;
+}
+
+function postProcessVin(vin) {
+  if (!vin) return "";
+  const cleaned = vin.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  if (cleaned.length === 17) return cleaned;
+  return "";
+}
+
 async function extractVehicleDetailsWithAI(text, vehicleType = "") {
   const promptBundle = getVehiclePromptBundle(vehicleType);
   const vehicleContext = vehicleType ? `\nVehicle type context: ${promptBundle.label}. Use this context to interpret the document and extract the correct VIN-related details.\n` : "";
@@ -720,23 +734,29 @@ async function extractVehicleDetailsWithAI(text, vehicleType = "") {
         {
           role: "system",
           content: `
-You are a fallback extraction model for vehicle documents.${vehicleContext}
+You are a highly precise OCR extraction engine for Indian vehicle documents and chassis/engine images.${vehicleContext}
+Locate the VIN / Chassis number, engine number, and fuel type from the OCR text.
 
-Return only the OCR-stage JSON shape with these fields:
+SYNONYMS & LABELS:
+- VIN / Chassis Number / Chassis No / CNo / Frame No / Frame Number / FNo / F: are all synonyms.
+- Engine Number / Engine No / Eng No / ENo / E: are all synonyms.
+
+STRICT RULES FOR VIN (CHASSIS NUMBER):
+- A valid Indian VIN is EXACTLY 17 characters long, uppercase, alphanumeric.
+- It never contains spaces, hyphens, or special characters.
+- If the OCR text has noise at the start or end (e.g., "NXE4KC407KSG1787746" or "AXEL40407KSG178774E" or "F: MD626AM10S1H01985 2025"), carefully extract the core 17-character VIN (e.g., "AE4KC407KSG178774" or "MD626AM10S1H01985").
+- Never invent/hallucinate a VIN. If no 17-character sequence (or near sequence that can be corrected to 17 characters by removing noise/spaces) is visible in the OCR text, leave "vin" as "".
+- Double check that the "vin" you output is exactly 17 characters long after removing spaces. If it is not 17 characters, do not output it.
+
+STRICT RULES FOR ENGINE NUMBER:
+- Extract only if explicitly labelled (e.g., Engine No, ENG NO, E:, etc.). Otherwise leave as "".
+
+Return only valid JSON in the format:
 {
   "vin": "",
   "engine_number": "",
   "fuel_type": ""
 }
-
-Use this category-specific fallback prompt:
-${promptBundle.llmPrompt}
-
-Rules:
-- Return only valid JSON.
-- VIN should be 17 characters when present.
-- If no confident value exists, return an empty string.
-- Keep the other final-stage fields empty for later enrichment.
           `,
         },
         {
@@ -749,7 +769,7 @@ Rules:
 
     const parsed = JSON.parse(response.choices[0].message.content || "{}");
     const result = {
-      vin: parsed.vin || "",
+      vin: postProcessVin(parsed.vin),
       engine_number: parsed.engine_number || "",
       hmil: "",
       invoice_number: "",
@@ -768,14 +788,10 @@ Rules:
       return {
         ...regexResult,
         ...result,
-        vin: result.vin || regexResult.vin || "",
+        vin: postProcessVin(result.vin || regexResult.vin),
         engine_number: result.engine_number || regexResult.engine_number || "",
         fuel_type: result.fuel_type || regexResult.fuel_type || "",
       };
-    }
-
-    if (result.vin) {
-      result.vin = result.vin.toUpperCase();
     }
 
     return result;
@@ -784,6 +800,7 @@ Rules:
     const regexResult = extractVehicleDetailsFromText(text, vehicleType);
     return {
       ...regexResult,
+      vin: postProcessVin(regexResult.vin),
       hmil: "",
       invoice_number: "",
       invoice_date: "",
@@ -845,12 +862,21 @@ async function uploadFileToMistral(file) {
   );
 
   const fileId = uploadResponse.data.id;
-  const urlResponse = await axios.get(
-    `https://api.mistral.ai/v1/files/${fileId}/url`,
-    { headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` } }
-  );
-
-  return urlResponse.data.url;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const urlResponse = await axios.get(
+        `https://api.mistral.ai/v1/files/${fileId}/url`,
+        { headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` } }
+      );
+      return urlResponse.data.url;
+    } catch (err) {
+      if (err.response?.status === 404 && attempt < 5) {
+        await sleep(2000);
+      } else {
+        throw err;
+      }
+    }
+  }
 }
 
 async function runOcrStage(fileUrl, modelName, stageName, vehicleType = "") {
@@ -877,294 +903,143 @@ async function runOcrStage(fileUrl, modelName, stageName, vehicleType = "") {
   return ocrResponse.data.pages?.[0]?.markdown || "";
 }
 
-async function cropVehicleImageBuffer(file) {
-  const isImage = file.mimetype && file.mimetype.startsWith("image/");
-  if (!isImage) {
-    console.log(`[Cropping] Skipping non-image file: ${file.originalname}`);
-    return file.buffer;
+async function cropVehicleWithPercent(buffer, cropPercent) {
+  if (!cropPercent || cropPercent >= 1.0) {
+    return buffer;
   }
-
-  console.log(`[Cropping] Processing image file: ${file.originalname}`);
   try {
-    const image = sharp(file.buffer);
+    const image = sharp(buffer);
     const metadata = await image.metadata();
     const width = metadata.width;
     const height = metadata.height;
-
-    // Step 1: Divide image into Working Region (top 75%) and Watermark Region (bottom 25%)
-    const workingHeight = Math.round(height * 0.75);
-
-    const workingBuffer = await image
-      .clone()
-      .extract({ left: 0, top: 0, width: width, height: workingHeight })
-      .toBuffer();
-
-    // Step 2: Upscale 2x and preprocess (grayscale + normalize + sharpen) to detect small text
-    const preprocessedBuffer = await sharp(workingBuffer)
-      .greyscale()
-      .resize(width * 2, workingHeight * 2, { kernel: sharp.kernel.lanczos3 })
-      .normalize()
-      .sharpen()
-      .toBuffer();
-
-    const isValidWord = (word) => {
-      const cleanText = word.text.replace(/[^A-Za-z0-9]/g, '');
-      return cleanText.length >= 2 && word.confidence > 30;
-    };
-
-    let minX = width;
-    let minY = workingHeight;
-    let maxX = 0;
-    let maxY = 0;
-    let foundValidText = false;
-
-    // Step 3: Run horizontal and vertical text detection using Tesseract v7
     
-    // Pass 1: Horizontal text (0 degrees)
-    console.log(`[Cropping] Running Pass 1 (Horizontal) for ${file.originalname}`);
-    const workerH = await createWorker('eng');
-    const { data: horizontalData } = await workerH.recognize(preprocessedBuffer, {}, { blocks: true });
-    await workerH.terminate();
-
-    if (horizontalData && horizontalData.blocks) {
-      for (const block of horizontalData.blocks) {
-        if (block.paragraphs) {
-          for (const para of block.paragraphs) {
-            if (para.lines) {
-              for (const line of para.lines) {
-                if (line.words) {
-                  for (const word of line.words) {
-                    if (isValidWord(word)) {
-                      const { x0, y0, x1, y1 } = word.bbox;
-                      const origX0 = Math.round(x0 / 2);
-                      const origY0 = Math.round(y0 / 2);
-                      const origX1 = Math.round(x1 / 2);
-                      const origY1 = Math.round(y1 / 2);
-
-                      if (origX0 < minX) minX = origX0;
-                      if (origY0 < minY) minY = origY0;
-                      if (origX1 > maxX) maxX = origX1;
-                      if (origY1 > maxY) maxY = origY1;
-                      foundValidText = true;
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Pass 2: Rotated 90 degrees clockwise
-    console.log(`[Cropping] Running Pass 2 (Rotated 90) for ${file.originalname}`);
-    const rotated90 = await sharp(preprocessedBuffer).rotate(90).toBuffer();
-    const workerRot90 = await createWorker('eng');
-    const { data: vert90Data } = await workerRot90.recognize(rotated90, {}, { blocks: true });
-    await workerRot90.terminate();
-
-    if (vert90Data && vert90Data.blocks) {
-      for (const block of vert90Data.blocks) {
-        if (block.paragraphs) {
-          for (const para of block.paragraphs) {
-            if (para.lines) {
-              for (const line of para.lines) {
-                if (line.words) {
-                  for (const word of line.words) {
-                    if (isValidWord(word)) {
-                      const { x0: rx0, y0: ry0, x1: rx1, y1: ry1 } = word.bbox;
-                      const origRx0 = rx0 / 2;
-                      const origRy0 = ry0 / 2;
-                      const origRx1 = rx1 / 2;
-                      const origRy1 = ry1 / 2;
-
-                      // Map back to original coordinate system
-                      const x0 = origRy0;
-                      const x1 = origRy1;
-                      const y0 = workingHeight - origRx1;
-                      const y1 = workingHeight - origRx0;
-
-                      if (x0 < minX) minX = x0;
-                      if (y0 < minY) minY = y0;
-                      if (x1 > maxX) maxX = x1;
-                      if (y1 > maxY) maxY = y1;
-                      foundValidText = true;
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Pass 3: Rotated 270 degrees clockwise (90 degrees counter-clockwise)
-    console.log(`[Cropping] Running Pass 3 (Rotated 270) for ${file.originalname}`);
-    const rotated270 = await sharp(preprocessedBuffer).rotate(270).toBuffer();
-    const workerRot270 = await createWorker('eng');
-    const { data: vert270Data } = await workerRot270.recognize(rotated270, {}, { blocks: true });
-    await workerRot270.terminate();
-
-    if (vert270Data && vert270Data.blocks) {
-      for (const block of vert270Data.blocks) {
-        if (block.paragraphs) {
-          for (const para of block.paragraphs) {
-            if (para.lines) {
-              for (const line of para.lines) {
-                if (line.words) {
-                  for (const word of line.words) {
-                    if (isValidWord(word)) {
-                      const { x0: rx0, y0: ry0, x1: rx1, y1: ry1 } = word.bbox;
-                      const origRx0 = rx0 / 2;
-                      const origRy0 = ry0 / 2;
-                      const origRx1 = rx1 / 2;
-                      const origRy1 = ry1 / 2;
-
-                      // Map back to original coordinate system
-                      const x0 = width - origRy1;
-                      const x1 = width - origRy0;
-                      const y0 = origRx0;
-                      const y1 = origRx1;
-
-                      if (x0 < minX) minX = x0;
-                      if (y0 < minY) minY = y0;
-                      if (x1 > maxX) maxX = x1;
-                      if (y1 > maxY) maxY = y1;
-                      foundValidText = true;
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    let cropX, cropY, cropW, cropH;
-
-    if (foundValidText) {
-      const padding = 80;
-      cropX = Math.max(0, minX - padding);
-      cropY = Math.max(0, minY - padding);
-      cropW = Math.min(width - cropX, (maxX - minX) + (padding * 2));
-      cropH = Math.min(workingHeight - cropY, (maxY - minY) + (padding * 2));
-      console.log(`[Cropping] Calculated text bounding box for ${file.originalname}: Left: ${cropX}, Top: ${cropY}, Width: ${cropW}, Height: ${cropH}`);
-    } else {
-      cropX = 0;
-      cropY = 0;
-      cropW = width;
-      cropH = workingHeight;
-      console.log(`[Cropping] No text detected for ${file.originalname}. Using the full working region.`);
-    }
-
-    // Step 4: Crop the text region, convert to black & white (grayscale), normalize contrast, sharpen, and export as JPEG
-    const finalImageBuffer = await sharp(file.buffer)
-      .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+    const cropHeight = Math.round(height * cropPercent);
+    return await image
+      .extract({ left: 0, top: 0, width: width, height: cropHeight })
       .greyscale()
       .normalize()
       .sharpen()
       .jpeg()
       .toBuffer();
-
-    console.log(`[Cropping] Successfully cropped image: ${file.originalname}`);
-    return finalImageBuffer;
-
   } catch (err) {
-    console.error(`[Cropping] Error cropping ${file.originalname}:`, err.message);
-    return file.buffer; // Fall back to original file buffer in case of any processing error
+    console.error(`[Cropping] Sharp error:`, err.message);
+    return buffer;
   }
 }
 
 async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "", addressDetails = {}) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      if (attempt === 1) {
-        try {
-          const croppedBuffer = await cropVehicleImageBuffer(file);
-          file.buffer = croppedBuffer;
-        } catch (cropErr) {
-          console.error(`[Cropping] Failed to crop file ${file.originalname}:`, cropErr.message);
-        }
+  const isImage = file.mimetype && file.mimetype.startsWith("image/");
+  const originalBuffer = file.buffer;
+
+  // Decide the crop passes based on vehicle type
+  const normalized = normalizeVehicleType(vehicleType);
+  const passes = [];
+
+  if (isImage) {
+    if (normalized === "two_wheeler" || normalized === "commercial_vehicle" || normalized === "commercial_equipment") {
+      passes.push(0.85, 0.80);
+    } else {
+      // For general documents and 4 wheelers (which are often invoices), try 100% height first, and fall back to 85% crop
+      passes.push(1.0, 0.85);
+    }
+  } else {
+    passes.push(null);
+  }
+
+  for (let passIndex = 0; passIndex < passes.length; passIndex++) {
+    const cropPercent = passes[passIndex];
+    console.log(`[${file.originalname}] Pass ${passIndex + 1}/${passes.length} (Crop: ${cropPercent ? (cropPercent * 100) + '%' : 'None'})`);
+
+    let currentBuffer = originalBuffer;
+    if (isImage && cropPercent !== null) {
+      try {
+        currentBuffer = await cropVehicleWithPercent(originalBuffer, cropPercent);
+      } catch (cropErr) {
+        console.error(`[Cropping] Failed to crop file ${file.originalname}:`, cropErr.message);
       }
-      const fileUrl = await uploadFileToMistral(file);
-      const promptBundle = getVehiclePromptBundle(vehicleType);
-      const stages = [{ name: "ocr3", model: OCR_3_MODEL }];
+    }
 
-      let lastOcrText = "";
-      for (const stage of stages) {
-        const ocrText = await runOcrStage(fileUrl, stage.model, stage.name, vehicleType);
-        lastOcrText = ocrText;
+    let passSuccess = false;
+    let resultData = null;
 
-        const stageResult = normalizeOcrStructuredOutput(ocrText);
-        if (isExtractionSuccessful(stageResult)) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        // Create a temporary file object with the cropped buffer
+        const tempFile = {
+          ...file,
+          buffer: currentBuffer
+        };
+
+        const fileUrl = await uploadFileToMistral(tempFile);
+        const rawOcrText = await runOcrStage(fileUrl, OCR_3_MODEL, "ocr3", vehicleType);
+        const cleanedOcrText = cleanMarkdown(rawOcrText);
+
+        const llmResult = await extractVehicleDetailsWithAI(cleanedOcrText, vehicleType);
+
+        if (isExtractionSuccessful(llmResult)) {
           const finalResult = {
-            vin: stageResult.vin || "",
-            engine_number: stageResult.engine_number || "",
-            hmil: "",
-            invoice_number: "",
-            invoice_date: "",
-            grand_total: "",
-            hyp_hps: "",
-            tag: "audit_image",
-            fuel_type: stageResult.fuel_type || "",
+            ...llmResult,
             address: addressDetails.address || "",
-            city: addressDetails.city || "",
-            state: addressDetails.state || "",
+            city: addressDetails.city || llmResult.city || "",
+            state: addressDetails.state || llmResult.state || "",
             pincode: addressDetails.pincode || "",
             country: "",
           };
-          console.log(`[${file.originalname}] Extraction succeeded with ${stage.name} for ${promptBundle.label}`);
-          return { file, aiResult: finalResult, success: true, source: stage.name };
+          console.log(`[${file.originalname}] Pass ${passIndex + 1} succeeded using DeepSeek!`);
+          resultData = { file, aiResult: finalResult, success: true, source: `pass_${passIndex + 1}` };
+          passSuccess = true;
+          break;
+        } else {
+          console.log(`[${file.originalname}] Pass ${passIndex + 1} did not find a valid 17-character VIN.`);
+          resultData = {
+            file,
+            aiResult: {
+              vin: "",
+              engine_number: "",
+              hmil: "",
+              invoice_number: "",
+              invoice_date: "",
+              grand_total: "",
+              hyp_hps: "",
+              tag: "audit_image",
+              fuel_type: "",
+              address: addressDetails.address || "",
+              city: addressDetails.city || "",
+              state: addressDetails.state || "",
+              pincode: addressDetails.pincode || "",
+              country: "",
+            },
+            success: false,
+            source: "failed"
+          };
+          break; // Don't retry the same pass if OCR and LLM completed but didn't find the VIN. Move to next pass!
+        }
+      } catch (err) {
+        const isLastAttempt = attempt === retries;
+        const status = err.response?.status;
+
+        if (status === 413 || status === 400) {
+          console.error(`[${file.originalname}] Payload error, skipping.`);
+          break;
+        }
+
+        if (isLastAttempt) {
+          console.error(`[${file.originalname}] Attempt ${attempt} failed on pass ${passIndex + 1}:`, err.message);
+        } else {
+          const backoff = attempt * 2000;
+          console.warn(`[${file.originalname}] Attempt ${attempt} failed on pass ${passIndex + 1}. Retrying in ${backoff}ms...`);
+          await sleep(backoff);
         }
       }
+    }
 
-      const llmResult = await extractVehicleDetailsWithAI(lastOcrText, vehicleType);
-      const finalResult = isExtractionSuccessful(llmResult) ? {
-        ...llmResult,
-        address: addressDetails.address || "",
-        city: addressDetails.city || llmResult.city || "",
-        state: addressDetails.state || llmResult.state || "",
-        pincode: addressDetails.pincode || "",
-      } : {
-        vin: "",
-        engine_number: "",
-        hmil: "",
-        invoice_number: "",
-        invoice_date: "",
-        grand_total: "",
-        hyp_hps: "",
-        tag: "audit_image",
-        fuel_type: "",
-        address: addressDetails.address || "",
-        city: addressDetails.city || "",
-        state: addressDetails.state || "",
-        pincode: addressDetails.pincode || "",
-        country: "",
-      };
-      return {
-        file,
-        aiResult: finalResult,
-        success: isExtractionSuccessful(finalResult),
-        source: isExtractionSuccessful(finalResult) ? "llm_fallback" : "failed",
-      };
-    } catch (err) {
-      const isLastAttempt = attempt === retries;
-      const status = err.response?.status;
+    if (passSuccess) {
+      return resultData;
+    }
 
-      if (status === 413 || status === 400) {
-        console.error(`[${file.originalname}] Payload error, skipping.`);
-        break;
-      }
-
-      if (isLastAttempt) {
-        console.error(`[${file.originalname}] Failed after ${retries} attempts:`, err.message);
-      } else {
-        const backoff = attempt * 2000;
-        console.warn(`[${file.originalname}] Attempt ${attempt} failed. Retrying in ${backoff}ms...`);
-        await sleep(backoff);
-      }
+    // If it's the last pass and it failed, return the failed resultData
+    if (passIndex === passes.length - 1) {
+      return resultData;
     }
   }
 
@@ -1356,7 +1231,7 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
         };
       });
 
-      const vinCell = dataRow.getCell(13);
+      const vinCell = dataRow.getCell(15);
       if (vinValid) {
         vinCell.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF375623" } };
         vinCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC6EFCE" } };
@@ -1383,7 +1258,7 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
     job.status = "done";
     job.clients.forEach((send) => send({ processed: job.total, total: job.total, status: "done" }));
   } catch (error) {
-    console.error(error.response?.data || error.message);
+    console.error("runJob error:", error);
     job.status = "error";
     job.error = "OCR Failed";
     job.clients.forEach((send) => send({ status: "error", error: "OCR Failed" }));
