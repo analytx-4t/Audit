@@ -1704,4 +1704,7 @@ app.post(
   },
 );
 
-app.listen(5000, () => console.log("Server running at 5000"));
+const server = app.listen(5000, () => console.log("Server running at 5000"));
+server.timeout = 10 * 60 * 1000; // 10 minutes timeout for large file uploads
+server.headersTimeout = 10 * 60 * 1000 + 5000;
+server.keepAliveTimeout = 10 * 60 * 1000;
