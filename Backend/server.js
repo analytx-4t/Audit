@@ -912,7 +912,6 @@ async function cropVehicleWithPercent(buffer, cropPercent) {
     const metadata = await image.metadata();
     const width = metadata.width;
     const height = metadata.height;
-    
     const cropHeight = Math.round(height * cropPercent);
     return await image
       .extract({ left: 0, top: 0, width: width, height: cropHeight })
@@ -1039,7 +1038,12 @@ async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "", add
 
     // If it's the last pass and it failed, return the failed resultData
     if (passIndex === passes.length - 1) {
-      return resultData;
+      return resultData || {
+        file,
+        aiResult: null,
+        success: false,
+        source: "processing_error"
+      };
     }
   }
 
@@ -1047,7 +1051,7 @@ async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "", add
 }
 
 // ─── HELPER: run array in batches ─────────────────────────
-async function processBatches(files, onFileProcessed = () => {}, vehicleType = "", addressDetails = {}) {
+async function processBatches(files, onFileProcessed = () => { }, vehicleType = "", addressDetails = {}) {
   const allResults = [];
 
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
@@ -1058,13 +1062,42 @@ async function processBatches(files, onFileProcessed = () => {}, vehicleType = "
       batch.map(async (f) => {
         const TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes per file
         let timer;
-        const processingPromise = processOneFile(f, MAX_RETRIES, vehicleType, addressDetails).then((r) => {
-          clearTimeout(timer);
-          return r;
-        }).catch((err) => {
-          clearTimeout(timer);
-          throw err;
-        });
+        const processingPromise = processOneFile(
+          f,
+          MAX_RETRIES,
+          vehicleType,
+          addressDetails
+        )
+          .then((result) => {
+            clearTimeout(timer);
+
+            // Defensive fallback: processOneFile should never return null,
+            // but prevent one invalid result from breaking the batch.
+            return result || {
+              file: f,
+              aiResult: null,
+              success: false,
+              source: "invalid_result"
+            };
+          })
+          .catch((err) => {
+            clearTimeout(timer);
+
+            console.error(
+              `[Batch] Unexpected processing error for ${f.originalname}:`,
+              err.message
+            );
+
+            // Convert the rejection into a normal failed-file result
+            // so Promise.all() can continue processing the batch.
+            return {
+              file: f,
+              aiResult: null,
+              success: false,
+              source: "processing_exception",
+              error: err.message
+            };
+          });
 
         const timeoutPromise = new Promise((resolve) => {
           timer = setTimeout(() => {
@@ -1160,22 +1193,22 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet("Sheet1");
     worksheet.columns = [
-      { header: "File Name",      key: "file_name",       width: 12 },
-      { header: "VIN",            key: "vin",              width: 22 },
-      { header: "Engine Number",  key: "engine_number",    width: 18 },
-      { header: "HMIL",           key: "hmil",             width: 10 },
-      { header: "Tag",            key: "tag",              width: 14 },
-      { header: "Invoice Number", key: "invoice_number",   width: 18 },
-      { header: "Invoice Date",   key: "invoice_date",     width: 14 },
-      { header: "Grand Total",    key: "grand_total",      width: 14 },
-      { header: "HYP/HPS",        key: "hyp_hps",          width: 10 },
-      { header: "Address",        key: "address",          width: 24 },
-      { header: "City",           key: "city",             width: 14 },
-      { header: "State",          key: "state",            width: 16 },
-      { header: "Pincode",        key: "pincode",          width: 12 },
-      { header: "Country",        key: "country",          width: 12 },
-      { header: "VIN Found",      key: "vin_found",        width: 12 },
-      { header: "Timeout",        key: "timeout",          width: 12 },
+      { header: "File Name", key: "file_name", width: 12 },
+      { header: "VIN", key: "vin", width: 22 },
+      { header: "Engine Number", key: "engine_number", width: 18 },
+      { header: "HMIL", key: "hmil", width: 10 },
+      { header: "Tag", key: "tag", width: 14 },
+      { header: "Invoice Number", key: "invoice_number", width: 18 },
+      { header: "Invoice Date", key: "invoice_date", width: 14 },
+      { header: "Grand Total", key: "grand_total", width: 14 },
+      { header: "HYP/HPS", key: "hyp_hps", width: 10 },
+      { header: "Address", key: "address", width: 24 },
+      { header: "City", key: "city", width: 14 },
+      { header: "State", key: "state", width: 16 },
+      { header: "Pincode", key: "pincode", width: 12 },
+      { header: "Country", key: "country", width: 12 },
+      { header: "VIN Found", key: "vin_found", width: 12 },
+      { header: "Timeout", key: "timeout", width: 12 },
     ];
 
     const headerRow = worksheet.getRow(1);
@@ -1184,10 +1217,10 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
       cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
       cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
       cell.border = {
-        top:    { style: "thin", color: { argb: "FF000000" } },
-        left:   { style: "thin", color: { argb: "FF000000" } },
+        top: { style: "thin", color: { argb: "FF000000" } },
+        left: { style: "thin", color: { argb: "FF000000" } },
         bottom: { style: "thin", color: { argb: "FF000000" } },
-        right:  { style: "thin", color: { argb: "FF000000" } },
+        right: { style: "thin", color: { argb: "FF000000" } },
       };
     });
     headerRow.height = 20;
@@ -1200,14 +1233,26 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
 
     const allResults = await processBatches(files, notify, vehicleType, addressDetails);
 
-    for (const { file, aiResult, success } of allResults) {
-      if (!success || !aiResult) { failedFiles.push(file); continue; }
+    for (const result of allResults) {
+      if (!result) {
+        console.error("[runJob] Invalid null/undefined result detected in allResults");
+        continue;
+      }
+
+      const { file, aiResult, success } = result;
+
+      if (!success || !aiResult) {
+        if (file) failedFiles.push(file);
+        continue;
+      }
 
       const vin = aiResult.vin?.trim() || "";
       const vinValid = vin.length === 17;
       if (!vinValid) failedFiles.push(file);
 
-      const vehicleKey = `${vin.toLowerCase()}_${aiResult.engine_number.trim().toLowerCase()}`;
+      const engineNumber = String(aiResult.engine_number || "").trim();
+
+      const vehicleKey = `${vin.toLowerCase()}_${engineNumber.toLowerCase()}`;
       uniqueVehicles.add(vehicleKey);
 
       const dataRow = worksheet.addRow([
@@ -1224,10 +1269,10 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
         cell.alignment = { horizontal: "center", vertical: "middle" };
         cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: isEven ? "FFD9E1F2" : "FFFFFFFF" } };
         cell.border = {
-          top:    { style: "thin", color: { argb: "FFB8CCE4" } },
-          left:   { style: "thin", color: { argb: "FFB8CCE4" } },
+          top: { style: "thin", color: { argb: "FFB8CCE4" } },
+          left: { style: "thin", color: { argb: "FFB8CCE4" } },
           bottom: { style: "thin", color: { argb: "FFB8CCE4" } },
-          right:  { style: "thin", color: { argb: "FFB8CCE4" } },
+          right: { style: "thin", color: { argb: "FFB8CCE4" } },
         };
       });
 
@@ -1356,7 +1401,7 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
 
 //       const vinFoundone = aiResult.vin && aiResult.vin.trim() !== "";
 
-      
+
 //       if (!vinFoundone) {
 //         failedFiles.push(file);
 //       }
@@ -1481,15 +1526,15 @@ app.post(
 
       // Load Custom File
       if (customFile.mimetype === "text/csv") {
-    // capture address details if provided
-    const addressDetails = {
-      address: req.body.address || "",
-      city: req.body.city || "",
-      state: req.body.state || "",
-      pincode: req.body.pincode || "",
-    };
-    console.log('[Upload] Starting job', jobId, 'vehicleType=', vehicleType, 'address=', addressDetails);
-    runJob(jobId, files, vehicleType, addressDetails);
+        // capture address details if provided
+        const addressDetails = {
+          address: req.body.address || "",
+          city: req.body.city || "",
+          state: req.body.state || "",
+          pincode: req.body.pincode || "",
+        };
+        console.log('[Upload] Starting job', jobId, 'vehicleType=', vehicleType, 'address=', addressDetails);
+        runJob(jobId, files, vehicleType, addressDetails);
       } else {
         await customWorkbook.xlsx.load(customFile.buffer);
       }
