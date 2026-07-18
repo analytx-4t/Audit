@@ -2,6 +2,15 @@ import { useState, useRef, useCallback } from "react";
 import JSZip from "jszip";
 import { ImageIcon, UploadCloud, X, Download, RefreshCw } from "lucide-react";
 
+const Backend = import.meta.env.VITE_BACKEND || "http://localhost:5000";
+
+const VEHICLE_OPTIONS = [
+  { value: "two_wheeler", label: "2 Wheeler" },
+  { value: "four_wheeler", label: "4 Wheeler" },
+  { value: "commercial_equipment", label: "Commercial Equipment" },
+  { value: "commercial_vehicle", label: "Commercial Vehicles" },
+];
+
 interface ImageEntry {
   file: File;
   preview: string;
@@ -17,10 +26,42 @@ function getExtension(filename: string) {
   return dot >= 0 ? filename.slice(dot) : "";
 }
 
+function replaceExtension(filename: string, newExt: string) {
+  const dot = filename.lastIndexOf(".");
+  return (dot >= 0 ? filename.slice(0, dot) : filename) + newExt;
+}
+
+// Crops + converts to greyscale + normalizes contrast, matching what the OCR
+// pipeline used to do right before upload — now done here at rename time.
+async function processImageForOcr(file: File, vehicleType: string, newName: string) {
+  try {
+    const formData = new FormData();
+    formData.append("image", file);
+    formData.append("vehicle_type", vehicleType);
+
+    const res = await fetch(`${Backend}/api/process-image`, {
+      method: "POST",
+      body: formData,
+    });
+    if (!res.ok) throw new Error(`Processing failed (${res.status})`);
+
+    const wasProcessed = res.headers.get("X-Image-Processed") === "true";
+    const blob = await res.blob();
+    return {
+      name: wasProcessed ? replaceExtension(newName, ".jpg") : newName,
+      blob,
+    };
+  } catch (err) {
+    console.error(`Failed to process ${file.name}, using original:`, err);
+    return { name: newName, blob: file };
+  }
+}
+
 export default function RenameImages() {
   const [images, setImages] = useState<ImageEntry[]>([]);
   const [dragging, setDragging] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [vehicleType, setVehicleType] = useState(VEHICLE_OPTIONS[1].value);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const buildEntries = useCallback((files: File[]): ImageEntry[] => {
@@ -67,10 +108,11 @@ export default function RenameImages() {
     setDownloading(true);
     try {
       const zip = new JSZip();
-      for (const entry of images) {
-        const buffer = await entry.file.arrayBuffer();
-        zip.file(entry.newName, buffer);
-      }
+      const processed = await Promise.all(
+        images.map((entry) => processImageForOcr(entry.file, vehicleType, entry.newName))
+      );
+      processed.forEach(({ name, blob }) => zip.file(name, blob));
+
       const blob = await zip.generateAsync({ type: "blob" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -99,9 +141,30 @@ export default function RenameImages() {
             Rename Images
           </h1>
           <p className="text-sm text-gray-500 dark:text-gray-400">
-            Upload photos — they'll be renamed to IMG_001, IMG_002… and
-            packaged into a ZIP for download.
+            Upload photos — they'll be renamed to IMG_001, IMG_002…, cropped
+            and cleaned up for OCR, and packaged into a ZIP for download.
           </p>
+        </div>
+
+        {/* Vehicle type selector */}
+        <div className="space-y-2">
+          <p className="text-xs font-medium text-gray-500 dark:text-gray-400">
+            Vehicle type (determines how images are cropped)
+          </p>
+          <div className="grid grid-cols-2 gap-2">
+            {VEHICLE_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => setVehicleType(option.value)}
+                className={`rounded-lg border px-3 py-2 text-sm font-medium transition ${vehicleType === option.value
+                  ? "border-emerald-500 bg-emerald-50 text-emerald-700 dark:border-emerald-400 dark:bg-emerald-500/20 dark:text-emerald-300"
+                  : "border-gray-200 bg-white text-gray-700 hover:border-gray-300 hover:bg-gray-50 dark:border-white/10 dark:bg-white/5 dark:text-gray-200 dark:hover:bg-white/10"}`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         {/* Drop zone */}
@@ -173,7 +236,7 @@ export default function RenameImages() {
                   text-white transition-colors shadow-sm"
               >
                 <Download className="w-3.5 h-3.5" />
-                {downloading ? "Packaging…" : "Download ZIP"}
+                {downloading ? "Processing…" : "Download ZIP"}
               </button>
             </div>
           </div>

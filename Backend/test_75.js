@@ -1,0 +1,210 @@
+import fs from "fs";
+import path from "path";
+import { config } from "dotenv";
+import sharp from "sharp";
+import axios from "axios";
+import FormData from "form-data";
+import OpenAI from "openai";
+
+config();
+
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+
+const openai = new OpenAI({
+  apiKey: DEEPSEEK_API_KEY,
+  baseURL: "https://api.deepseek.com",
+});
+
+const OCR_3_MODEL = "mistral-ocr-latest";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function uploadFileToMistral(buffer, filename, mimetype) {
+  const formData = new FormData();
+  formData.append("file", buffer, {
+    filename: filename,
+    contentType: mimetype,
+  });
+  formData.append("purpose", "ocr");
+
+  const uploadResponse = await axios.post(
+    "https://api.mistral.ai/v1/files",
+    formData,
+    {
+      headers: {
+        ...formData.getHeaders(),
+        Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    }
+  );
+
+  const fileId = uploadResponse.data.id;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const urlResponse = await axios.get(
+        `https://api.mistral.ai/v1/files/${fileId}/url`,
+        { headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` } }
+      );
+      return urlResponse.data.url;
+    } catch (err) {
+      if (err.response?.status === 404 && attempt < 5) {
+        await sleep(2000);
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+async function runOcrStage(fileUrl) {
+  const ocrResponse = await axios.post(
+    "https://api.mistral.ai/v1/ocr",
+    {
+      model: OCR_3_MODEL,
+      document: { type: "document_url", document_url: fileUrl },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${MISTRAL_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  return ocrResponse.data.pages?.[0]?.markdown || "";
+}
+
+function cleanMarkdown(text) {
+  if (!text) return "";
+  // Strip image links e.g. ![img-0.jpeg](img-0.jpeg)
+  let cleaned = text.replace(/!\[.*?\]\(.*?\)/gi, "");
+  // Strip ordinary links
+  cleaned = cleaned.replace(/\[.*?\]\(.*?\)/gi, "");
+  return cleaned;
+}
+
+function postProcessVin(vin) {
+  if (!vin) return "";
+  const cleaned = vin.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  if (cleaned.length === 17) return cleaned;
+  return "";
+}
+
+async function extractVehicleDetailsWithAI(text) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "deepseek-chat",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `
+You are a highly precise OCR extraction engine for Indian vehicle documents and chassis images.
+Locate the VIN / Chassis number, engine number, and fuel type from the OCR text.
+
+STRICT RULES FOR VIN (CHASSIS NUMBER):
+- A valid Indian VIN is EXACTLY 17 characters long, uppercase, alphanumeric.
+- It never contains spaces, hyphens, or special characters.
+- If the OCR text has noise at the start or end (e.g., "NXE4KC407KSG1787746" or "AXEL40407KSG178774E"), carefully extract the core 17-character VIN (e.g., "AE4KC407KSG178774").
+- Never invent/hallucinate a VIN. If no 17-character sequence (or near sequence that can be corrected to 17 characters) is visible in the OCR text, leave "vin" as "".
+- Double check that the "vin" you output is exactly 17 characters long. If it is not 17 characters, do not output it.
+
+STRICT RULES FOR ENGINE NUMBER:
+- Extract only if explicitly labelled (e.g., Engine No, ENG NO, etc.). Otherwise leave as "".
+
+Return only valid JSON in the format:
+{
+  "vin": "",
+  "engine_number": "",
+  "fuel_type": ""
+}
+          `,
+        },
+        {
+          role: "user",
+          content: text,
+        },
+      ],
+      temperature: 0,
+    });
+
+    const parsed = JSON.parse(response.choices[0].message.content || "{}");
+    return {
+      vin: postProcessVin(parsed.vin),
+      engine_number: (parsed.engine_number || "").trim(),
+      fuel_type: (parsed.fuel_type || "").trim(),
+    };
+  } catch (error) {
+    console.error("LLM fallback extraction failed:", error.message);
+    return { vin: "", engine_number: "", fuel_type: "" };
+  }
+}
+
+async function testAll() {
+  const dirPath = "../Two Wheelers";
+  const files = fs.readdirSync(dirPath).filter(f => f.toLowerCase().endsWith(".jpg") || f.toLowerCase().endsWith(".jpeg"));
+  
+  console.log(`Found ${files.length} images to test.`);
+
+  const results = [];
+
+  for (const file of files) {
+    console.log(`\n--------------------------------------------`);
+    console.log(`Processing: ${file}`);
+    const filePath = path.join(dirPath, file);
+    
+    const originalBuffer = fs.readFileSync(filePath);
+    const metadata = await sharp(originalBuffer).metadata();
+    const width = metadata.width;
+    const height = metadata.height;
+    const cropHeight = Math.round(height * 0.75);
+
+    // 1. Color crop
+    const colorBuffer = await sharp(originalBuffer)
+      .extract({ left: 0, top: 0, width: width, height: cropHeight })
+      .jpeg()
+      .toBuffer();
+
+    // 2. Grayscale + contrast crop
+    const grayBuffer = await sharp(originalBuffer)
+      .extract({ left: 0, top: 0, width: width, height: cropHeight })
+      .greyscale()
+      .normalize()
+      .sharpen()
+      .jpeg()
+      .toBuffer();
+
+    // Color OCR
+    console.log(`[Color] Uploading...`);
+    const colorUrl = await uploadFileToMistral(colorBuffer, `color75_${file}`, "image/jpeg");
+    console.log(`[Color] OCR...`);
+    const colorOcrRaw = await runOcrStage(colorUrl);
+    const colorOcrCleaned = cleanMarkdown(colorOcrRaw);
+    const colorRes = await extractVehicleDetailsWithAI(colorOcrCleaned);
+    console.log(`[Color] Result:`, colorRes);
+
+    // Gray OCR
+    console.log(`[Gray] Uploading...`);
+    const grayUrl = await uploadFileToMistral(grayBuffer, `gray75_${file}`, "image/jpeg");
+    console.log(`[Gray] OCR...`);
+    const grayOcrRaw = await runOcrStage(grayUrl);
+    const grayOcrCleaned = cleanMarkdown(grayOcrRaw);
+    const grayRes = await extractVehicleDetailsWithAI(grayOcrCleaned);
+    console.log(`[Gray] Result:`, grayRes);
+
+    results.push({
+      file,
+      colorVin: colorRes.vin,
+      colorEngine: colorRes.engine_number,
+      grayVin: grayRes.vin,
+      grayEngine: grayRes.engine_number
+    });
+  }
+
+  console.log("\n================ SUMMARY ================");
+  console.table(results);
+}
+
+testAll().catch(console.error);

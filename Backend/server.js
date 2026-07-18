@@ -52,6 +52,16 @@ function normalizeVehicleType(vehicleType = "") {
   return "general";
 }
 
+// Crop height percentage used when preparing an image (rename module) for OCR.
+// Mirrors the primary (first) pass the OCR pipeline used to run before cropping moved here.
+function getPrimaryCropPercent(vehicleType = "") {
+  const normalized = normalizeVehicleType(vehicleType);
+  if (normalized === "two_wheeler" || normalized === "commercial_vehicle" || normalized === "commercial_equipment") {
+    return 0.85;
+  }
+  return 1.0;
+}
+
 function getVehiclePromptBundle(vehicleType = "") {
   const normalizedType = normalizeVehicleType(vehicleType);
   const bundles = {
@@ -828,6 +838,33 @@ app.get("/", (req, res) => {
   return res.json({ message: " Server started at 5000" });
 });
 
+// ─── RENAME MODULE: crop + greyscale + contrast normalization ─────
+// Same processing that used to run right before OCR now runs here, so the
+// rename step hands off an already-cropped/B&W/contrast-normalized image.
+app.post("/api/process-image", upload.single("image"), async (req, res) => {
+  const file = req.file;
+  if (!file) {
+    return res.status(400).json({ error: "No image uploaded" });
+  }
+  if (!file.mimetype || !file.mimetype.startsWith("image/")) {
+    return res.status(400).json({ error: "File is not an image" });
+  }
+
+  try {
+    const vehicleType = req.body.vehicle_type || req.body.vehicleType || "";
+    const cropPercent = getPrimaryCropPercent(vehicleType);
+    const processedBuffer = await cropVehicleWithPercent(file.buffer, cropPercent);
+    const wasProcessed = !!cropPercent && cropPercent < 1.0;
+
+    res.setHeader("Content-Type", wasProcessed ? "image/jpeg" : file.mimetype);
+    res.setHeader("X-Image-Processed", String(wasProcessed));
+    res.send(processedBuffer);
+  } catch (err) {
+    console.error("[process-image] Failed to process image:", err.message);
+    res.status(500).json({ error: "Failed to process image" });
+  }
+});
+
 
 
 
@@ -927,127 +964,74 @@ async function cropVehicleWithPercent(buffer, cropPercent) {
 }
 
 async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "", addressDetails = {}) {
-  const isImage = file.mimetype && file.mimetype.startsWith("image/");
-  const originalBuffer = file.buffer;
+  // Cropping / greyscale / contrast normalization now happens in the rename
+  // module (see /api/process-image) before the file ever reaches this pipeline,
+  // so files are uploaded to Mistral as-is here.
+  let resultData = null;
 
-  // Decide the crop passes based on vehicle type
-  const normalized = normalizeVehicleType(vehicleType);
-  const passes = [];
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const fileUrl = await uploadFileToMistral(file);
+      const rawOcrText = await runOcrStage(fileUrl, OCR_3_MODEL, "ocr3", vehicleType);
+      const cleanedOcrText = cleanMarkdown(rawOcrText);
 
-  if (isImage) {
-    if (normalized === "two_wheeler" || normalized === "commercial_vehicle" || normalized === "commercial_equipment") {
-      passes.push(0.85, 0.80);
-    } else {
-      // For general documents and 4 wheelers (which are often invoices), try 100% height first, and fall back to 85% crop
-      passes.push(1.0, 0.85);
-    }
-  } else {
-    passes.push(null);
-  }
+      const llmResult = await extractVehicleDetailsWithAI(cleanedOcrText, vehicleType);
 
-  for (let passIndex = 0; passIndex < passes.length; passIndex++) {
-    const cropPercent = passes[passIndex];
-    console.log(`[${file.originalname}] Pass ${passIndex + 1}/${passes.length} (Crop: ${cropPercent ? (cropPercent * 100) + '%' : 'None'})`);
-
-    let currentBuffer = originalBuffer;
-    if (isImage && cropPercent !== null) {
-      try {
-        currentBuffer = await cropVehicleWithPercent(originalBuffer, cropPercent);
-      } catch (cropErr) {
-        console.error(`[Cropping] Failed to crop file ${file.originalname}:`, cropErr.message);
-      }
-    }
-
-    let passSuccess = false;
-    let resultData = null;
-
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      try {
-        // Create a temporary file object with the cropped buffer
-        const tempFile = {
-          ...file,
-          buffer: currentBuffer
+      if (isExtractionSuccessful(llmResult)) {
+        const finalResult = {
+          ...llmResult,
+          address: addressDetails.address || "",
+          city: addressDetails.city || llmResult.city || "",
+          state: addressDetails.state || llmResult.state || "",
+          pincode: addressDetails.pincode || "",
+          country: "",
         };
-
-        const fileUrl = await uploadFileToMistral(tempFile);
-        const rawOcrText = await runOcrStage(fileUrl, OCR_3_MODEL, "ocr3", vehicleType);
-        const cleanedOcrText = cleanMarkdown(rawOcrText);
-
-        const llmResult = await extractVehicleDetailsWithAI(cleanedOcrText, vehicleType);
-
-        if (isExtractionSuccessful(llmResult)) {
-          const finalResult = {
-            ...llmResult,
+        console.log(`[${file.originalname}] Succeeded using DeepSeek!`);
+        return { file, aiResult: finalResult, success: true, source: "pass_1" };
+      } else {
+        console.log(`[${file.originalname}] Did not find a valid 17-character VIN.`);
+        return {
+          file,
+          aiResult: {
+            vin: "",
+            engine_number: "",
+            hmil: "",
+            invoice_number: "",
+            invoice_date: "",
+            grand_total: "",
+            hyp_hps: "",
+            tag: "audit_image",
+            fuel_type: "",
             address: addressDetails.address || "",
-            city: addressDetails.city || llmResult.city || "",
-            state: addressDetails.state || llmResult.state || "",
+            city: addressDetails.city || "",
+            state: addressDetails.state || "",
             pincode: addressDetails.pincode || "",
             country: "",
-          };
-          console.log(`[${file.originalname}] Pass ${passIndex + 1} succeeded using DeepSeek!`);
-          resultData = { file, aiResult: finalResult, success: true, source: `pass_${passIndex + 1}` };
-          passSuccess = true;
-          break;
-        } else {
-          console.log(`[${file.originalname}] Pass ${passIndex + 1} did not find a valid 17-character VIN.`);
-          resultData = {
-            file,
-            aiResult: {
-              vin: "",
-              engine_number: "",
-              hmil: "",
-              invoice_number: "",
-              invoice_date: "",
-              grand_total: "",
-              hyp_hps: "",
-              tag: "audit_image",
-              fuel_type: "",
-              address: addressDetails.address || "",
-              city: addressDetails.city || "",
-              state: addressDetails.state || "",
-              pincode: addressDetails.pincode || "",
-              country: "",
-            },
-            success: false,
-            source: "failed"
-          };
-          break; // Don't retry the same pass if OCR and LLM completed but didn't find the VIN. Move to next pass!
-        }
-      } catch (err) {
-        const isLastAttempt = attempt === retries;
-        const status = err.response?.status;
-
-        if (status === 413 || status === 400) {
-          console.error(`[${file.originalname}] Payload error, skipping.`);
-          break;
-        }
-
-        if (isLastAttempt) {
-          console.error(`[${file.originalname}] Attempt ${attempt} failed on pass ${passIndex + 1}:`, err.message);
-        } else {
-          const backoff = attempt * 2000;
-          console.warn(`[${file.originalname}] Attempt ${attempt} failed on pass ${passIndex + 1}. Retrying in ${backoff}ms...`);
-          await sleep(backoff);
-        }
+          },
+          success: false,
+          source: "failed"
+        };
       }
-    }
+    } catch (err) {
+      const isLastAttempt = attempt === retries;
+      const status = err.response?.status;
 
-    if (passSuccess) {
-      return resultData;
-    }
+      if (status === 413 || status === 400) {
+        console.error(`[${file.originalname}] Payload error, skipping.`);
+        break;
+      }
 
-    // If it's the last pass and it failed, return the failed resultData
-    if (passIndex === passes.length - 1) {
-      return resultData || {
-        file,
-        aiResult: null,
-        success: false,
-        source: "processing_error"
-      };
+      if (isLastAttempt) {
+        console.error(`[${file.originalname}] Attempt ${attempt} failed:`, err.message);
+      } else {
+        const backoff = attempt * 2000;
+        console.warn(`[${file.originalname}] Attempt ${attempt} failed. Retrying in ${backoff}ms...`);
+        await sleep(backoff);
+      }
     }
   }
 
-  return { file, aiResult: null, success: false };
+  return resultData || { file, aiResult: null, success: false, source: "processing_error" };
 }
 
 // ─── HELPER: run array in batches ─────────────────────────
@@ -1704,7 +1688,4 @@ app.post(
   },
 );
 
-const server = app.listen(5000, () => console.log("Server running at 5000"));
-server.timeout = 10 * 60 * 1000; // 10 minutes timeout for large file uploads
-server.headersTimeout = 10 * 60 * 1000 + 5000;
-server.keepAliveTimeout = 10 * 60 * 1000;
+app.listen(5000, () => console.log("Server running at 5000"));
