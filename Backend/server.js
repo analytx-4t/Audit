@@ -21,6 +21,7 @@ app.use(
   cors({
     origin: [
       "http://localhost:5173",
+      "http://localhost:5174",
       "https://audit-tool-one.vercel.app",
       "https://audit-tool-ipri.vercel.app",
       "https://audit-tool-new.vercel.app",
