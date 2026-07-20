@@ -44,6 +44,102 @@ const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 const OCR_3_MODEL = process.env.MISTRAL_OCR_3_MODEL || "mistral-ocr-latest";
 const STICKER_ONLY_INSTRUCTION = "The input is a close-up image of a vehicle identification sticker or manufacturer plate. Ignore unrelated scene content, geotagged metadata, and any non-sticker text. Extract only the requested identification fields.";
 
+let tesseractWorker = null;
+createWorker("eng")
+  .then(w => {
+    tesseractWorker = w;
+    console.log("[Tesseract] Global worker initialized successfully");
+  })
+  .catch(err => {
+    console.error("[Tesseract] Global worker initialization failed:", err.message);
+  });
+
+function calculateOcrScore(ocrData) {
+  if (!ocrData || !ocrData.text) return 0;
+  const text = ocrData.text;
+  
+  // Find all alphanumeric words of length >= 3
+  const words = text.split(/[^A-Za-z0-9]+/);
+  let score = 0;
+  
+  for (const word of words) {
+    if (word.length >= 3) {
+      const hasLetter = /[A-Za-z]/.test(word);
+      const hasNumber = /[0-9]/.test(word);
+      
+      let wordScore = word.length;
+      if (hasLetter && hasNumber) {
+        wordScore *= 3; // Boost mixed alphanumeric strings (like VIN parts)
+      }
+      
+      score += wordScore;
+    }
+  }
+  
+  // Multiply by average confidence
+  const conf = ocrData.confidence || 0;
+  return score * conf;
+}
+
+async function resolve180Ambiguity(buffer, angle1, angle2) {
+  if (!tesseractWorker) {
+    console.log(`[Tesseract] Worker not initialized, defaulting to angle1: ${angle1}°`);
+    return angle1;
+  }
+
+  try {
+    const evaluateAngle = async (angle) => {
+      // 1. Prepare normal image
+      const imgNormal = await sharp(buffer)
+        .rotate(angle, { background: { r: 255, g: 255, b: 255 } })
+        .resize(600, null, { fit: 'inside' })
+        .greyscale()
+        .normalize()
+        .toBuffer();
+
+      const resNormal = await tesseractWorker.recognize(imgNormal);
+      const scoreNormal = calculateOcrScore(resNormal.data);
+      const confNormal = resNormal.data.confidence || 0;
+
+      // 2. Prepare negated image
+      const imgNeg = await sharp(buffer)
+        .rotate(angle, { background: { r: 255, g: 255, b: 255 } })
+        .resize(600, null, { fit: 'inside' })
+        .greyscale()
+        .negate()
+        .normalize()
+        .toBuffer();
+
+      const resNeg = await tesseractWorker.recognize(imgNeg);
+      const scoreNeg = calculateOcrScore(resNeg.data);
+      const confNeg = resNeg.data.confidence || 0;
+
+      return scoreNormal >= scoreNeg
+        ? { score: scoreNormal, confidence: confNormal }
+        : { score: scoreNeg, confidence: confNeg };
+    };
+
+    const res1 = await evaluateAngle(angle1);
+    const res2 = await evaluateAngle(angle2);
+
+    console.log(`[Tesseract Ambiguity] Angle ${angle1}°: Best Score = ${res1.score.toFixed(1)} (conf: ${res1.confidence}%) | Angle ${angle2}°: Best Score = ${res2.score.toFixed(1)} (conf: ${res2.confidence}%)`);
+
+    if (res1.score === 0 && res2.score === 0) {
+      if (res1.confidence >= 15 || res2.confidence >= 15) {
+        return res1.confidence >= res2.confidence ? angle1 : angle2;
+      }
+      console.log(`[Tesseract Ambiguity] Neither angle yielded readable text. Defaulting to angle1: ${angle1}°`);
+      return angle1;
+    }
+
+    return res1.score >= res2.score ? angle1 : angle2;
+  } catch (err) {
+    console.error(`[Tesseract Ambiguity] Error resolving:`, err.message);
+    return angle1;
+  }
+}
+
+
 function normalizeVehicleType(vehicleType = "") {
   const normalized = (vehicleType || "").toString().trim().toLowerCase();
   if (normalized.includes("2") || normalized.includes("two")) return "two_wheeler";
@@ -56,12 +152,65 @@ function normalizeVehicleType(vehicleType = "") {
 // Crop height percentage used when preparing an image (rename module) for OCR.
 // Mirrors the primary (first) pass the OCR pipeline used to run before cropping moved here.
 function getPrimaryCropPercent(vehicleType = "") {
-  const normalized = normalizeVehicleType(vehicleType);
-  if (normalized === "two_wheeler" || normalized === "commercial_vehicle" || normalized === "commercial_equipment") {
-    return 0.85;
-  }
-  return 1.0;
+  // Crop the bottom 25% for all vehicle types to permanently discard GPS location watermarks
+  return 0.75;
 }
+
+async function hasGeoLocationWatermark(buffer) {
+  if (!tesseractWorker) {
+    console.warn("[hasGeoLocationWatermark] Worker not initialized yet, defaulting to true");
+    return true;
+  }
+  try {
+    const metadata = await sharp(buffer).rotate().metadata();
+    const w = metadata.width;
+    const h = metadata.height;
+    if (!w || !h) return true;
+
+    // Sample bottom 35% of the image at full resolution
+    const bH = Math.round(h * 0.35);
+    const bTop = h - bH;
+    const bottomBuffer = await sharp(buffer)
+      .rotate()
+      .extract({ left: 0, top: bTop, width: w, height: bH })
+      .greyscale()
+      .normalize()
+      .toBuffer();
+
+    const ocrRes = await tesseractWorker.recognize(bottomBuffer);
+    const text = (ocrRes?.data?.text || "").toLowerCase();
+
+    const watermarkPatterns = [
+      /\bgps\b/,
+      /map\s*camera/,
+      /\blat\b|\blatitude\b/,
+      /\blong\b|\blongitude\b/,
+      /\baltitude\b|\belevation\b|\bspeed:\b|\bindex\s*number\b/,
+      /gmt\s*\+\s*\d{2}/,
+      /\d{1,3}\.\d{3,}\s*[°]?\s*[nsew]?/,
+      /\b\d{2}\.\d{4,}\b/,
+      /\b(mon|tue|wed|thu|fri|sat|sun)\b/,
+      /\((mon|tue|wed|thu|fri|sat|sun)\)/,
+      /\b(am|pm)\b|\((am|pm)\)/,
+      /\b\d{4}[/-]\d{2}[/-]\d{2}/,
+      /\b[a-z0-9]{4,6}\+[a-z0-9]{2,}\b/,
+      /\b(punjab|delhi|maharashtra|uttar pradesh|gujarat|haryana|karnataka|tamil nadu|kerala|west bengal|rajasthan|madhya pradesh)\b/,
+      /\b\d{6}\b/,
+      /\b(india|google|gmap)\b/,
+      /\d{1,3}\s*°/,
+      /\b202[4-9]\b/,
+      /\b\d{1,2}:\d{2}\b/
+    ];
+
+    const isWatermarked = watermarkPatterns.some(p => p.test(text));
+    console.log(`[Watermark Check] ${isWatermarked ? "Geo location watermark detected -> cropping bottom 25%" : "No geo location watermark detected -> keeping 100% full image"}`);
+    return isWatermarked;
+  } catch (err) {
+    console.error("[hasGeoLocationWatermark] Error:", err.message);
+    return true; // Fallback to cropping if error
+  }
+}
+
 
 function getVehiclePromptBundle(vehicleType = "") {
   const normalizedType = normalizeVehicleType(vehicleType);
@@ -854,11 +1003,11 @@ app.post("/api/process-image", upload.single("image"), async (req, res) => {
   try {
     const vehicleType = req.body.vehicle_type || req.body.vehicleType || "";
     const cropPercent = getPrimaryCropPercent(vehicleType);
-    const processedBuffer = await cropVehicleWithPercent(file.buffer, cropPercent);
-    const wasProcessed = !!cropPercent && cropPercent < 1.0;
+    const processedBuffer = await cropVehicleWithPercent(file.buffer, cropPercent, vehicleType);
+    const wasProcessed = true;
 
-    res.setHeader("Content-Type", wasProcessed ? "image/jpeg" : file.mimetype);
-    res.setHeader("X-Image-Processed", String(wasProcessed));
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("X-Image-Processed", "true");
     res.send(processedBuffer);
   } catch (err) {
     console.error("[process-image] Failed to process image:", err.message);
@@ -941,28 +1090,246 @@ async function runOcrStage(fileUrl, modelName, stageName, vehicleType = "") {
   return ocrResponse.data.pages?.[0]?.markdown || "";
 }
 
-async function cropVehicleWithPercent(buffer, cropPercent) {
-  if (!cropPercent || cropPercent >= 1.0) {
-    return buffer;
-  }
+async function detectSkew(normalizedBuffer, vehicleType = "") {
   try {
-    const image = sharp(buffer);
-    const metadata = await image.metadata();
+    const normalizedType = normalizeVehicleType(vehicleType);
+    const canBeVertical = (normalizedType === "two_wheeler" || normalizedType === "general");
+    const metadata = await sharp(normalizedBuffer).metadata();
     const width = metadata.width;
     const height = metadata.height;
-    const cropHeight = Math.round(height * cropPercent);
-    return await image
-      .extract({ left: 0, top: 0, width: width, height: cropHeight })
-      .greyscale()
-      .normalize()
-      .sharpen()
-      .jpeg()
+
+    // Crop top 75% and remove 15% border on left/right and 5% on top/bottom for clean sampling
+    const workingHeight = Math.round(height * 0.75);
+    const borderX = Math.round(width * 0.15);
+    const borderY = Math.round(workingHeight * 0.05);
+    const cropW = width - (borderX * 2);
+    const cropH = workingHeight - (borderY * 2);
+
+    if (cropW <= 0 || cropH <= 0) return 0;
+
+    // Force crop order by converting to buffer first
+    const croppedBuffer = await sharp(normalizedBuffer)
+      .extract({ left: borderX, top: borderY, width: cropW, height: cropH })
       .toBuffer();
+
+    // Clean buffer (top 75% height, full width) for Tesseract OCR to avoid cropping VIN text
+    const cleanOcrBuffer = await sharp(normalizedBuffer)
+      .extract({ left: 0, top: 0, width: width, height: workingHeight })
+      .toBuffer();
+
+    const sourceW = 500;
+    const sourceH = 400;
+
+    // 1. Horizontal source
+    const sourceImage = await sharp(croppedBuffer)
+      .greyscale()
+      .resize(sourceW, sourceH, { fit: 'fill' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const srcData = sourceImage.data;
+
+    // 2. Vertical source (rotate 90 first, then resize)
+    const sourceImageRot = await sharp(croppedBuffer)
+      .greyscale()
+      .rotate(90)
+      .resize(sourceW, sourceH, { fit: 'fill' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const srcDataRot = sourceImageRot.data;
+
+    // Target dimensions for safe rotated region
+    const targetW = 300;
+    const targetH = 200;
+    const centerX = sourceW / 2;
+    const centerY = sourceH / 2;
+    const targetCenterX = targetW / 2;
+    const targetCenterY = targetH / 2;
+
+    let bestHorizAngle = 0;
+    let maxHorizVariance = -1;
+
+    for (let angle = -30; angle <= 30; angle += 1) {
+      const rad = -angle * Math.PI / 180;
+      const cosVal = Math.cos(rad);
+      const sinVal = Math.sin(rad);
+
+      const targetData = new Uint8Array(targetW * targetH);
+
+      for (let y = 0; y < targetH; y++) {
+        const dy = y - targetCenterY;
+        for (let x = 0; x < targetW; x++) {
+          const dx = x - targetCenterX;
+          
+          const srcX = Math.round(cosVal * dx - sinVal * dy + centerX);
+          const srcY = Math.round(sinVal * dx + cosVal * dy + centerY);
+
+          const clampedX = Math.min(Math.max(srcX, 0), sourceW - 1);
+          const clampedY = Math.min(Math.max(srcY, 0), sourceH - 1);
+
+          targetData[y * targetW + x] = srcData[clampedY * sourceW + clampedX];
+        }
+      }
+
+      // Calculate vertical gradients of target
+      const rowGrads = new Array(targetH).fill(0);
+      for (let y = 1; y < targetH; y++) {
+        let sum = 0;
+        for (let x = 0; x < targetW; x++) {
+          const diff = Math.abs(targetData[y * targetW + x] - targetData[(y - 1) * targetW + x]);
+          sum += diff > 20 ? diff : 0;
+        }
+        rowGrads[y] = sum;
+      }
+
+      const mean = rowGrads.reduce((a, b) => a + b, 0) / targetH;
+      const variance = rowGrads.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / targetH;
+
+      if (variance > maxHorizVariance) {
+        maxHorizVariance = variance;
+        bestHorizAngle = angle;
+      }
+    }
+
+    let bestVertAngle = 0;
+    let maxVertVariance = -1;
+
+    if (canBeVertical) {
+      for (let angle = -30; angle <= 30; angle += 1) {
+        const rad = -angle * Math.PI / 180;
+        const cosVal = Math.cos(rad);
+        const sinVal = Math.sin(rad);
+
+        const targetData = new Uint8Array(targetW * targetH);
+
+        for (let y = 0; y < targetH; y++) {
+          const dy = y - targetCenterY;
+          for (let x = 0; x < targetW; x++) {
+            const dx = x - targetCenterX;
+            
+            const srcX = Math.round(cosVal * dx - sinVal * dy + centerX);
+            const srcY = Math.round(sinVal * dx + cosVal * dy + centerY);
+
+            const clampedX = Math.min(Math.max(srcX, 0), sourceW - 1);
+            const clampedY = Math.min(Math.max(srcY, 0), sourceH - 1);
+
+            targetData[y * targetW + x] = srcDataRot[clampedY * sourceW + clampedX];
+          }
+        }
+
+        // Calculate vertical gradients of target
+        const rowGrads = new Array(targetH).fill(0);
+        for (let y = 1; y < targetH; y++) {
+          let sum = 0;
+          for (let x = 0; x < targetW; x++) {
+            const diff = Math.abs(targetData[y * targetW + x] - targetData[(y - 1) * targetW + x]);
+            sum += diff > 20 ? diff : 0;
+          }
+          rowGrads[y] = sum;
+        }
+
+        const mean = rowGrads.reduce((a, b) => a + b, 0) / targetH;
+        const variance = rowGrads.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / targetH;
+
+        if (variance > maxVertVariance) {
+          maxVertVariance = variance;
+          bestVertAngle = angle;
+        }
+      }
+    }
+
+    const isVertical = canBeVertical && (maxVertVariance > maxHorizVariance);
+    if (isVertical) {
+      const angle1 = 270 + bestVertAngle;
+      const angle2 = 90 + bestVertAngle;
+      console.log(`[Deskew] Detected Vertical Axis. Candidates: ${angle1}° vs ${angle2}°`);
+      const chosenAngle = await resolve180Ambiguity(cleanOcrBuffer, angle1, angle2);
+      return chosenAngle;
+    } else {
+      const angle1 = bestHorizAngle;
+      const angle2 = (bestHorizAngle + 180) % 360;
+      console.log(`[Deskew] Detected Horizontal Axis. Candidates: ${angle1}° vs ${angle2}°`);
+      const chosenAngle = await resolve180Ambiguity(cleanOcrBuffer, angle1, angle2);
+      return chosenAngle;
+    }
   } catch (err) {
-    console.error(`[Cropping] Sharp error:`, err.message);
-    return buffer;
+    console.error(`Error in detectSkew:`, err.message);
+    return 0;
   }
 }
+
+async function cropVehicleWithPercent(buffer, cropPercent = 0.75, vehicleType = "") {
+  try {
+    // 0. Normalize EXIF orientation to avoid coordinate mapping issues
+    const normalizedBuffer = await sharp(buffer).rotate().toBuffer();
+    const metadata = await sharp(normalizedBuffer).metadata();
+    const width = metadata.width;
+    const height = metadata.height;
+
+    // Check if image has a geo location watermark before deciding whether to crop
+    const hasWatermark = await hasGeoLocationWatermark(normalizedBuffer);
+    const effectiveCropPercent = hasWatermark ? (cropPercent || 0.75) : 1.0;
+    if (!hasWatermark) {
+      console.log(`[Watermark] Image does NOT have geo location watermark. Skipping bottom crop (effective crop: 100%).`);
+    } else {
+      console.log(`[Watermark] Image HAS geo location watermark. Applying bottom crop (effective crop: ${Math.round(effectiveCropPercent * 100)}%).`);
+    }
+
+    // 1. Detect Skew
+    const bestAngle = await detectSkew(normalizedBuffer, vehicleType);
+    console.log(`[Deskew] Best angle detected: ${bestAngle}°`);
+
+    // 2. Separate main image and watermark if effectiveCropPercent < 1.0 (removing watermark)
+    if (effectiveCropPercent && effectiveCropPercent < 1.0) {
+      const workingHeight = Math.round(height * effectiveCropPercent);
+
+      const mainBuffer = await sharp(normalizedBuffer)
+        .extract({ left: 0, top: 0, width: width, height: workingHeight })
+        .toBuffer();
+
+      // 3. Rotate main image and apply processing (greyscale, normalize, sharpen)
+      const rotatedMainImage = await sharp(mainBuffer)
+        .rotate(bestAngle, { background: { r: 255, g: 255, b: 255 } })
+        .greyscale()
+        .normalize()
+        .sharpen()
+        .jpeg()
+        .toBuffer();
+
+      return rotatedMainImage;
+    } else {
+      // Rotate the entire image and apply processing
+      return await sharp(normalizedBuffer)
+        .rotate(bestAngle, { background: { r: 255, g: 255, b: 255 } })
+        .greyscale()
+        .normalize()
+        .sharpen()
+        .jpeg()
+        .toBuffer();
+    }
+  } catch (err) {
+    console.error(`[Cropping/Deskewing] Error:`, err.message);
+    // Fallback: simple processing
+    try {
+      const normalizedBuffer = await sharp(buffer).rotate().toBuffer();
+      const metadata = await sharp(normalizedBuffer).metadata();
+      const cropHeight = cropPercent ? Math.round(metadata.height * cropPercent) : metadata.height;
+      return await sharp(normalizedBuffer)
+        .extract({ left: 0, top: 0, width: metadata.width, height: cropHeight })
+        .greyscale()
+        .normalize()
+        .sharpen()
+        .jpeg()
+        .toBuffer();
+    } catch (fallbackErr) {
+      console.error(`[Cropping/Deskewing] Fallback also failed:`, fallbackErr.message);
+      return buffer;
+    }
+  }
+}
+
+
 
 async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "", addressDetails = {}) {
   // Cropping / greyscale / contrast normalization now happens in the rename
@@ -1690,3 +2057,6 @@ app.post(
 );
 
 app.listen(5000, () => console.log("Server running at 5000"));
+
+export { cropVehicleWithPercent, hasGeoLocationWatermark, getPrimaryCropPercent };
+
