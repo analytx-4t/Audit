@@ -530,81 +530,75 @@ Return only JSON.`,
     commercial_equipment: {
       key: "commercial_equipment",
       label: "Commercial Equipment",
-      ocr3Prompt: `You are extracting identification data from commercial equipment.
+      ocr3Prompt: `You are an OCR extraction engine specialized in commercial equipment, tractors, and heavy machinery identification plates.
 
-Required
+${STICKER_ONLY_INSTRUCTION}
 
-VIN Number
+Locate the manufacturer identification plate, chassis plate, or engine label.
 
-Engine Number
+Extract:
+• VIN / Chassis Serial Number
+• Engine Serial Number
+• Fuel Type
 
-Fuel Type
+Synonyms for VIN / Chassis Serial Number:
+- CHASSIS SERIAL NO / CHASSIS SERIAL NO.
+- CHASSIS SERIAL / CHASSIS NO / CHASSIS NUMBER
+- CLASSIS SERIAL NO
+- SERIAL NO / SERIAL NUMBER
+- VIN / VIN NUMBER
+- PIN / PRODUCT IDENTIFICATION NUMBER
+- FRAME NO / FRAME NUMBER
 
-Locate the manufacturer identification plate.
+Synonyms for Engine Serial Number:
+- ENGINE SERIAL NO / ENGINE SERIAL NO.
+- ENGINE SERIAL / ENGINE NO / ENGINE NUMBER
+- ENG NO / MOTOR NO
 
-Read only fields explicitly labelled
+VIN / Chassis Serial Rules:
+- A chassis serial number / VIN is an uppercase alphanumeric identifier (typically 10 to 17 characters long, e.g. 1VY5210EASB045343, 1PY5310ECTC072100, 5310EASA028920).
+- Read every visible character carefully.
+- Extract exact sequence without extra spaces or symbols.
+- If unreadable, return empty string.
 
-VIN
+Engine Number Rules:
+- Extract ONLY when explicitly labelled with any engine serial / engine number synonyms (e.g. PY3029T368274, PY3029U129877).
 
-ENGINE NO
+Fuel Type Rules:
+- Commercial equipment typically uses DIESEL. Normalize to PETROL, DIESEL, CNG, LPG, ELECTRIC, EV.
 
-ENGINE NUMBER
-
-FUEL
-
-Ignore
-
-Model
-
-Approval Numbers
-
-Weights
-
-Ratings
-
-Return
-
+Return ONLY JSON:
 {
-"vin_number":"",
-"engine_number":"",
-"fuel_type":""
+  "vin_number":"",
+  "engine_number":"",
+  "fuel_type":""
 }`,
-      ocr4Prompt: `Perform a complete inspection of the manufacturer plate.
+      ocr4Prompt: `You are performing an exhaustive OCR inspection on a commercial equipment / tractor identification plate.
 
-Inspect engraved text.
+Search order:
+1. Manufacturer identification plate
+2. Chassis serial stamping / label (CHASSIS SERIAL NO, CHASSIS NO, VIN)
+3. Engine serial label (ENGINE SERIAL NO, ENGINE NO)
 
-Inspect faded regions.
+Extract:
+- VIN / Chassis Serial Number
+- Engine Serial Number
+- Fuel Type
 
-Inspect rotated labels.
+Return ONLY JSON:
+{
+  "vin_number":"",
+  "engine_number":"",
+  "fuel_type":""
+}`,
+      llmPrompt: `You are visually verifying a commercial equipment / tractor manufacturer plate.
 
-Locate
+Locate:
+- VIN / Chassis Serial Number (CHASSIS SERIAL NO / VIN)
+- Engine Serial Number (ENGINE SERIAL NO / ENGINE NO)
+- Fuel Type
 
-VIN
-
-Engine Number
-
-Fuel Type
-
-Return only values that can be confidently read.
-
-Otherwise return empty strings.
-
-Output JSON only.`,
-      llmPrompt: `Visually inspect the identification plate.
-
-Recover
-
-VIN
-
-Engine Number
-
-Fuel Type
-
-Do not infer hidden characters.
-
-Only return values with high confidence.
-
-Return JSON.`,
+Return JSON only.`,
       schema: {
         type: "object",
         properties: {
@@ -775,9 +769,19 @@ function extractVehicleDetailsFromText(text = "", vehicleType = "") {
   };
 
   const content = text || "";
-  const vinMatches = content.match(/\b[A-Za-z0-9]{17}\b/g) || [];
-  if (vinMatches.length > 0) {
-    result.vin = vinMatches[0].toUpperCase();
+  const normType = normalizeVehicleType(vehicleType);
+
+  const chassisMatch = content.match(/(?:chassis\s*(?:serial\s*)?(?:no\.?|number)?|classis\s*serial\s*no\.?|vin|frame\s*no\.?)\s*[:#-]?\s*([A-Za-z0-9]{10,17})/i);
+  if (chassisMatch && chassisMatch[1]) {
+    result.vin = chassisMatch[1].toUpperCase();
+  } else {
+    const vinRegex = (normType === "commercial_equipment" || normType === "commercial_vehicle")
+      ? /\b[A-Za-z0-9]{10,17}\b/g
+      : /\b[A-Za-z0-9]{17}\b/g;
+    const vinMatches = content.match(vinRegex) || [];
+    if (vinMatches.length > 0) {
+      result.vin = vinMatches[0].toUpperCase();
+    }
   }
 
   const hmilMatch = content.match(/\b[A-Za-z0-9]{17}\b/g) || [];
@@ -785,7 +789,7 @@ function extractVehicleDetailsFromText(text = "", vehicleType = "") {
     result.hmil = hmilMatch[1]?.toUpperCase() || "";
   }
 
-  const engineMatch = content.match(/engine(?:\s*number|\s*no\.?|\s*no)?\s*[:#-]?\s*([A-Za-z0-9\-\/\s]{2,30})/i);
+  const engineMatch = content.match(/(?:engine|eng)\s*(?:serial\s*)?(?:number|no\.?|no)?\s*[:#-]?\s*([A-Za-z0-9\-\/\s]{2,30})/i);
   if (engineMatch && engineMatch[1]) {
     result.engine_number = engineMatch[1].trim().replace(/\s+/g, " ");
   }
@@ -827,10 +831,12 @@ function extractVehicleDetailsFromText(text = "", vehicleType = "") {
   return result;
 }
 
-function isExtractionSuccessful(result = {}) {
+function isExtractionSuccessful(result = {}, vehicleType = "") {
   const vin = String(result.vin || "").trim();
   const engineNumber = String(result.engine_number || "").trim();
-  return Boolean(vin.length === 17 || engineNumber);
+  const normType = normalizeVehicleType(vehicleType);
+  const minVinLen = (normType === "commercial_equipment" || normType === "commercial_vehicle") ? 10 : 17;
+  return Boolean((vin.length >= minVinLen && vin.length <= 17) || engineNumber);
 }
 
 function normalizeOcrStructuredOutput(text = "") {
@@ -856,10 +862,10 @@ function normalizeOcrStructuredOutput(text = "") {
     // fall back to regex-based extraction below
   }
 
-  const vinMatch = candidate.match(/\b[A-Za-z0-9]{17}\b/);
+  const vinMatch = candidate.match(/\b[A-Za-z0-9]{10,17}\b/);
   if (vinMatch) result.vin = vinMatch[0].toUpperCase();
 
-  const engineMatch = candidate.match(/engine(?:\s*number|\s*no\.?|\s*no)?\s*[:#-]?\s*([A-Za-z0-9\-\/\s]{2,30})/i);
+  const engineMatch = candidate.match(/(?:engine|eng)\s*(?:serial\s*)?(?:number|no\.?|no)?\s*[:#-]?\s*([A-Za-z0-9\-\/\s]{2,30})/i);
   if (engineMatch && engineMatch[1]) result.engine_number = engineMatch[1].trim().replace(/\s+/g, " ");
 
   const fuelMatch = candidate.match(/\b(petrol|diesel|cng|lpg|electric|ev)\b/i);
@@ -875,9 +881,13 @@ function cleanMarkdown(text) {
   return cleaned;
 }
 
-function postProcessVin(vin) {
+function postProcessVin(vin, vehicleType = "") {
   if (!vin) return "";
   const cleaned = vin.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  const normType = normalizeVehicleType(vehicleType);
+  if (normType === "commercial_equipment" || normType === "commercial_vehicle") {
+    if (cleaned.length >= 10 && cleaned.length <= 17) return cleaned;
+  }
   if (cleaned.length === 17) return cleaned;
   return "";
 }
@@ -894,22 +904,21 @@ async function extractVehicleDetailsWithAI(text, vehicleType = "") {
         {
           role: "system",
           content: `
-You are a highly precise OCR extraction engine for Indian vehicle documents and chassis/engine images.${vehicleContext}
-Locate the VIN / Chassis number, engine number, and fuel type from the OCR text.
+You are a highly precise OCR extraction engine for Indian vehicle documents, commercial equipment, tractors, and chassis/engine images.${vehicleContext}
+Locate the VIN / Chassis number / Chassis Serial Number, engine number / engine serial number, and fuel type from the OCR text.
 
 SYNONYMS & LABELS:
-- VIN / Chassis Number / Chassis No / CNo / Frame No / Frame Number / FNo / F: are all synonyms.
-- Engine Number / Engine No / Eng No / ENo / E: are all synonyms.
+- VIN / Chassis Number / Chassis No / Chassis Serial No / Chassis Serial / Classis Serial No / CNo / Frame No / Frame Number / FNo / F / PIN / Product Identification Number / Serial No are all synonyms for VIN.
+- Engine Number / Engine No / Engine Serial No / Engine Serial / Eng No / ENo / E / Motor No are all synonyms for Engine Number.
 
 STRICT RULES FOR VIN (CHASSIS NUMBER):
-- A valid Indian VIN is EXACTLY 17 characters long, uppercase, alphanumeric.
+- For passenger/two-wheelers, a valid Indian VIN is 17 characters long. For commercial equipment/tractors/commercial vehicles, a chassis serial / VIN is typically 10 to 17 characters long (e.g., 1VY5210EASB045343, 1PY5310ECTC072100, 5310EASA028920).
 - It never contains spaces, hyphens, or special characters.
-- If the OCR text has noise at the start or end (e.g., "NXE4KC407KSG1787746" or "AXEL40407KSG178774E" or "F: MD626AM10S1H01985 2025"), carefully extract the core 17-character VIN (e.g., "AE4KC407KSG178774" or "MD626AM10S1H01985").
-- Never invent/hallucinate a VIN. If no 17-character sequence (or near sequence that can be corrected to 17 characters by removing noise/spaces) is visible in the OCR text, leave "vin" as "".
-- Double check that the "vin" you output is exactly 17 characters long after removing spaces. If it is not 17 characters, do not output it.
+- Carefully extract the exact core alphanumeric VIN or chassis serial sequence.
+- Never invent/hallucinate a VIN. If no valid sequence is visible in the OCR text, leave "vin" as "".
 
 STRICT RULES FOR ENGINE NUMBER:
-- Extract only if explicitly labelled (e.g., Engine No, ENG NO, E:, etc.). Otherwise leave as "".
+- Extract only if explicitly labelled (e.g., Engine No, ENGINE SERIAL NO, ENGINE SERIAL, ENG NO, E:, etc.). Otherwise leave as "".
 
 Return only valid JSON in the format:
 {
@@ -929,7 +938,7 @@ Return only valid JSON in the format:
 
     const parsed = JSON.parse(response.choices[0].message.content || "{}");
     const result = {
-      vin: postProcessVin(parsed.vin),
+      vin: postProcessVin(parsed.vin, vehicleType),
       engine_number: parsed.engine_number || "",
       hmil: "",
       invoice_number: "",
@@ -943,12 +952,12 @@ Return only valid JSON in the format:
       country: "",
     };
 
-    if (!isExtractionSuccessful(result)) {
+    if (!isExtractionSuccessful(result, vehicleType)) {
       const regexResult = extractVehicleDetailsFromText(text, vehicleType);
       return {
         ...regexResult,
         ...result,
-        vin: postProcessVin(result.vin || regexResult.vin),
+        vin: postProcessVin(result.vin || regexResult.vin, vehicleType),
         engine_number: result.engine_number || regexResult.engine_number || "",
         fuel_type: result.fuel_type || regexResult.fuel_type || "",
       };
@@ -960,7 +969,7 @@ Return only valid JSON in the format:
     const regexResult = extractVehicleDetailsFromText(text, vehicleType);
     return {
       ...regexResult,
-      vin: postProcessVin(regexResult.vin),
+      vin: postProcessVin(regexResult.vin, vehicleType),
       hmil: "",
       invoice_number: "",
       invoice_date: "",
@@ -1345,7 +1354,7 @@ async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "", add
 
       const llmResult = await extractVehicleDetailsWithAI(cleanedOcrText, vehicleType);
 
-      if (isExtractionSuccessful(llmResult)) {
+      if (isExtractionSuccessful(llmResult, vehicleType)) {
         const finalResult = {
           ...llmResult,
           address: addressDetails.address || "",
@@ -1357,7 +1366,7 @@ async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "", add
         console.log(`[${file.originalname}] Succeeded using DeepSeek!`);
         return { file, aiResult: finalResult, success: true, source: "pass_1" };
       } else {
-        console.log(`[${file.originalname}] Did not find a valid 17-character VIN.`);
+        console.log(`[${file.originalname}] Did not find a valid VIN/Chassis number.`);
         return {
           file,
           aiResult: {
@@ -1599,7 +1608,10 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
       }
 
       const vin = aiResult.vin?.trim() || "";
-      const vinValid = vin.length === 17;
+      const normType = normalizeVehicleType(vehicleType);
+      const vinValid = (normType === "commercial_equipment" || normType === "commercial_vehicle")
+        ? (vin.length >= 10 && vin.length <= 17)
+        : (vin.length === 17);
       if (!vinValid) failedFiles.push(file);
 
       const engineNumber = String(aiResult.engine_number || "").trim();
@@ -2058,5 +2070,5 @@ app.post(
 
 app.listen(5000, () => console.log("Server running at 5000"));
 
-export { cropVehicleWithPercent, hasGeoLocationWatermark, getPrimaryCropPercent };
+export { cropVehicleWithPercent, hasGeoLocationWatermark, getPrimaryCropPercent, processOneFile, getVehiclePromptBundle, extractVehicleDetailsWithAI };
 
