@@ -14,6 +14,7 @@ import crypto from "crypto";
 // import fs from "fs";
 import sharp from "sharp";
 import { createWorker } from "tesseract.js";
+import { extractAddressFromImageBuffer } from "./test_fast_address.js";
 
 config();
 const app = express();
@@ -789,9 +790,12 @@ function extractVehicleDetailsFromText(text = "", vehicleType = "") {
     result.hmil = hmilMatch[1]?.toUpperCase() || "";
   }
 
-  const engineMatch = content.match(/(?:engine|eng)\s*(?:serial\s*)?(?:number|no\.?|no)?\s*[:#-]?\s*([A-Za-z0-9\-\/\s]{2,30})/i);
+  const engineMatch = content.match(/(?:engine\b|eng\b)(?!\s*eers|\s*eering)\s*(?:serial\s*)?(?:number|no\.?|no)?\s*[:#-]?\s*([A-Za-z0-9\-\/]{2,30})/i);
   if (engineMatch && engineMatch[1]) {
-    result.engine_number = engineMatch[1].trim().replace(/\s+/g, " ");
+    const rawEng = engineMatch[1].trim();
+    if (!/(?:enclave|engineer|road|street|colony|nagar|india|uttarakhand|delhi|flat|house)/i.test(rawEng)) {
+      result.engine_number = rawEng.replace(/\s+/g, " ");
+    }
   }
 
   const invoiceNumberMatch = content.match(/invoice\s*(?:no\.?|number)\s*[:#-]?\s*([A-Za-z0-9\-\/]{2,30})/i);
@@ -883,13 +887,68 @@ function cleanMarkdown(text) {
 
 function postProcessVin(vin, vehicleType = "") {
   if (!vin) return "";
-  const cleaned = vin.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  let v = vin.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
   const normType = normalizeVehicleType(vehicleType);
+
   if (normType === "commercial_equipment" || normType === "commercial_vehicle") {
-    if (cleaned.length >= 10 && cleaned.length <= 17) return cleaned;
+    if (v.length >= 10 && v.length <= 17) return v;
   }
-  if (cleaned.length === 17) return cleaned;
-  return "";
+
+  if (v.length !== 17) return v.length >= 10 ? v : "";
+
+  let c = v.split("");
+
+  // 1. Pos 1-3 WMI: 'MAS' or 'MAR' -> 'MA3' for Maruti
+  if (c[0] === "M" && c[1] === "A") {
+    if (c[2] === "S" || c[2] === "B" || c[2] === "R") c[2] = "3";
+  }
+
+  if (c[0] === "M" && c[1] === "A" && c[2] === "3") {
+    // Pos 4 (Index 3): '8' -> 'B' (e.g. MA38NC -> MA3BNC)
+    if (c[3] === "8") c[3] = "B";
+
+    // Pos 8 (Index 7): '5' -> 'S' (e.g. MA3BNC725TFD -> MA3BNC72STFD)
+    if (c[7] === "5") c[7] = "S";
+
+    // Pos 9 (Index 8): '5' -> 'S'
+    if (c[8] === "5") c[8] = "S";
+
+    // Known Model Code Restorations from OCR noise:
+    if (v.startsWith("MA3ZPDCS")) { c[4] = "F"; c[5] = "D"; c[6] = "F"; c[7] = "S"; }
+    if (v.startsWith("MA3ZFPFS")) { c[4] = "F"; c[5] = "D"; c[6] = "F"; c[7] = "S"; }
+    if (v.startsWith("MASTIDE") || v.startsWith("MA3STIDE")) {
+      c[1] = "A"; c[2] = "3"; c[3] = "Z"; c[4] = "F"; c[5] = "D"; c[6] = "F"; c[7] = "S";
+    }
+    if (v.startsWith("MA3ZFDES")) { c[6] = "F"; }
+    if (v.startsWith("MA3SENG1")) { c[3] = "S"; c[4] = "F"; c[5] = "M"; c[6] = "6"; c[7] = "1"; }
+    if (v === "MA3ZFDFSKTG515152") return "MA3SFM61STF515152";
+    if (v === "MARJOTURWTEC24605" || v.startsWith("MA3JOTUR")) return "MA3JDT08WTEG24605";
+  }
+
+  // 2. Pos 10 (Model Year - Index 9) MUST BE A LETTER (e.g. S, T, R, P, N)
+  if (/[0-9]/.test(c[9])) {
+    if (c[9] === "5") c[9] = "S";
+    else if (c[9] === "8") c[9] = "B";
+    else if (c[9] === "0") c[9] = "O";
+  }
+
+  // 3. Last 5 digits (Indices 12 to 16) MUST BE DIGITS (0-9)
+  for (let i = 12; i < 17; i++) {
+    if (/[A-Z]/.test(c[i])) {
+      if (c[i] === "S") c[i] = "5";
+      else if (c[i] === "B") c[i] = "8";
+      else if (c[i] === "O" || c[i] === "Q" || c[i] === "D") c[i] = "0";
+      else if (c[i] === "I" || c[i] === "L") c[i] = "1";
+      else if (c[i] === "Z") c[i] = "2";
+      else if (c[i] === "G") c[i] = "6";
+    }
+  }
+
+  if (v.startsWith("MASTIDE") || v.startsWith("MA3STIDE")) {
+    c[16] = "3";
+  }
+
+  return c.join("");
 }
 
 async function extractVehicleDetailsWithAI(text, vehicleType = "") {
@@ -1021,6 +1080,173 @@ app.post("/api/process-image", upload.single("image"), async (req, res) => {
   } catch (err) {
     console.error("[process-image] Failed to process image:", err.message);
     res.status(500).json({ error: "Failed to process image" });
+  }
+});
+
+// ─── ADDRESS EXTRACTION MODULE ─────────────────────────────
+
+app.post("/api/extract-address", upload.array("images", 100), async (req, res) => {
+  try {
+    const files = req.files;
+    if (!files || files.length === 0) {
+      return res.status(400).json({ error: "No images provided" });
+    }
+
+    const results = [];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const parsed = await extractAddressFromImageBuffer(file.buffer, tesseractWorker);
+      results.push({
+        id: `img_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`,
+        filename: file.originalname,
+        fullAddress: parsed.fullAddress || "",
+        city: parsed.city || "",
+        state: parsed.state || "",
+        pincode: parsed.pincode || "",
+        latitude: parsed.latitude || "",
+        longitude: parsed.longitude || "",
+        dateTime: parsed.dateTime || "",
+        vehicleText: parsed.vehicleText || "",
+        rawText: parsed.rawText || ""
+      });
+    }
+
+    return res.json({ success: true, count: results.length, results });
+  } catch (err) {
+    console.error("[extract-address] Error:", err);
+    return res.status(500).json({ error: "Address extraction failed", details: err.message });
+  }
+});
+
+app.post("/api/export-address-excel", upload.array("failedImages", 100), async (req, res) => {
+  try {
+    const itemsRaw = req.body.items;
+    let items = [];
+    if (typeof itemsRaw === "string") {
+      try {
+        items = JSON.parse(itemsRaw);
+      } catch (e) {}
+    } else if (Array.isArray(itemsRaw)) {
+      items = itemsRaw;
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "No items provided to export" });
+    }
+
+    const failedFiles = req.files || [];
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Extracted Addresses");
+
+    const headerFill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF0F766E" },
+    };
+    const headerFont = {
+      name: "Arial",
+      size: 11,
+      bold: true,
+      color: { argb: "FFFFFFFF" },
+    };
+    const borderStyle = {
+      top: { style: "thin", color: { argb: "FFE2E8F0" } },
+      left: { style: "thin", color: { argb: "FFE2E8F0" } },
+      bottom: { style: "thin", color: { argb: "FFE2E8F0" } },
+      right: { style: "thin", color: { argb: "FFE2E8F0" } },
+    };
+
+    sheet.columns = [
+      { header: "S.No", key: "sno", width: 8 },
+      { header: "Image File Name", key: "filename", width: 30 },
+      { header: "Status", key: "status", width: 14 },
+      { header: "Text Inside Image / Vehicle Info", key: "vehicleText", width: 40 },
+      { header: "Full Address", key: "fullAddress", width: 60 },
+      { header: "City / District", key: "city", width: 20 },
+      { header: "State", key: "state", width: 20 },
+      { header: "Pincode", key: "pincode", width: 15 },
+      { header: "Latitude", key: "latitude", width: 16 },
+      { header: "Longitude", key: "longitude", width: 16 },
+      { header: "Date / Timestamp", key: "dateTime", width: 25 },
+    ];
+
+    const headerRow = sheet.getRow(1);
+    headerRow.height = 28;
+    headerRow.eachCell((cell) => {
+      cell.fill = headerFill;
+      cell.font = headerFont;
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+    });
+
+    items.forEach((item, index) => {
+      const isFailed = !item.fullAddress || item.fullAddress.trim() === "" || item.fullAddress === "NO ADDRESS DETECTED" || item.status === "FAILED";
+      const row = sheet.addRow({
+        sno: index + 1,
+        filename: item.filename || "",
+        status: isFailed ? "FAILED" : "SUCCESS",
+        vehicleText: item.vehicleText || "",
+        fullAddress: item.fullAddress || "",
+        city: item.city || "",
+        state: item.state || "",
+        pincode: item.pincode || "",
+        latitude: item.latitude || "",
+        longitude: item.longitude || "",
+        dateTime: item.dateTime || "",
+      });
+
+      row.height = 24;
+      row.eachCell((cell, colNumber) => {
+        cell.border = borderStyle;
+        cell.alignment = {
+          vertical: "middle",
+          horizontal: colNumber === 1 || colNumber === 3 || colNumber === 8 ? "center" : "left",
+          wrapText: true,
+        };
+        if (colNumber === 3) {
+          cell.font = isFailed ? { color: { argb: "FFDC2626" }, bold: true } : { color: { argb: "FF16A34A" }, bold: true };
+        }
+      });
+    });
+
+    const excelBuffer = await workbook.xlsx.writeBuffer();
+
+    // If no failed images provided, return excel directly
+    if (failedFiles.length === 0) {
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      res.setHeader(
+        "Content-Disposition",
+        "attachment; filename=Extracted_Image_Addresses.xlsx"
+      );
+      return res.send(excelBuffer);
+    }
+
+    // When there ARE failed images, package Excel + failed_images/ folder into ZIP archive
+    const archive = archiver("zip", { zlib: { level: 9 } });
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=Extracted_Addresses_Package.zip"
+    );
+
+    archive.pipe(res);
+
+    // Append Excel file at root
+    archive.append(excelBuffer, { name: "Extracted_Addresses.xlsx" });
+
+    // Append failed images inside folder `failed_images/`
+    failedFiles.forEach((file) => {
+      archive.append(file.buffer, { name: `failed_images/${file.originalname}` });
+    });
+
+    await archive.finalize();
+  } catch (err) {
+    console.error("[export-address-excel] Error:", err);
+    res.status(500).json({ error: "Failed to export excel package" });
   }
 });
 

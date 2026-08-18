@@ -56,6 +56,7 @@ export default function Header() {
       {/* Nav */}
       <nav className="hidden md:flex items-center gap-1">
         {[
+          { label: "Extract Address", to: "/extract-address" },
           { label: "Rename Images", to: "/rename-images" },
           { label: "Image Upload", to: "/" },
           { label: "Excel Upload", to: "/combine" },
