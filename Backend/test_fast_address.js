@@ -20,10 +20,37 @@ const sampleDirs = [
   '../IMAGE NOT READ BY PORTAL'
 ];
 
+function cleanLineNoise(line) {
+  if (!line) return '';
+  let l = line.trim();
+  
+  // Replace slashes before address words like /Marg -> Marg
+  l = l.replace(/\/([A-Za-z]+)/g, ' $1');
+
+  // Strip leading garbage symbols, lone numbers/letters from map box OCR noise
+  l = l.replace(/^[^a-zA-Z0-9\s#\/\-\.\,]+/, '');
+  l = l.replace(/^(?:[a-z0-9]{1,4}|[§£©¥\[\]\{\}\(\)\/\\\|\-\s]+)\s+(?=[A-Z])/i, '');
+  
+  // Clean trailing single letter noise like ", S" or ", p"
+  l = l.replace(/,\s*[A-Za-z]$/, '');
+  l = l.replace(/[^a-zA-Z0-9\.\,\-\s\(\)]+$/, '');
+
+  return l.trim();
+}
+
+const indianStates = [
+  'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh', 'Goa', 'Gujarat',
+  'Haryana', 'Himachal Pradesh', 'Jharkhand', 'Karnataka', 'Kerala', 'Madhya Pradesh',
+  'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram', 'Nagaland', 'Odisha', 'Punjab',
+  'Rajasthan', 'Sikkim', 'Tamil Nadu', 'Telangana', 'Tripura', 'Uttar Pradesh',
+  'Uttarakhand', 'West Bengal', 'Delhi', 'New Delhi', 'Jammu & Kashmir', 'Ladakh',
+  'Chandigarh', 'Puducherry', 'Dadra and Nagar Haveli', 'Daman and Diu', 'Lakshadweep', 'Andaman and Nicobar'
+];
+
 export function cleanAddressText(text) {
   if (!text) return { fullAddress: '', city: '', state: '', pincode: '', latitude: '', longitude: '', dateTime: '', vehicleText: '' };
   
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const rawLines = text.split('\n').map(l => l.trim()).filter(Boolean);
 
   let latitude = '';
   let longitude = '';
@@ -49,11 +76,6 @@ export function cleanAddressText(text) {
   if (dateMatch) dateTime = dateMatch[0].trim();
 
   // Extract State
-  const indianStates = [
-    'Maharashtra', 'Delhi', 'Punjab', 'Haryana', 'Gujarat', 'Karnataka', 'Tamil Nadu',
-    'Kerala', 'West Bengal', 'Rajasthan', 'Madhya Pradesh', 'Uttar Pradesh', 'Telangana',
-    'Andhra Pradesh', 'Bihar', 'Jharkhand', 'Odisha', 'Assam', 'Goa', 'Chhattisgarh', 'Uttarakhand'
-  ];
   for (const s of indianStates) {
     if (new RegExp(`\\b${s}\\b`, 'i').test(text)) {
       state = s;
@@ -61,77 +83,110 @@ export function cleanAddressText(text) {
     }
   }
 
+  // Extract City/District heuristic
+  const cityMatch = text.match(/\b(New Delhi|Delhi|Mumbai|Pune|Bengaluru|Bangalore|Hyderabad|Chennai|Kolkata|Ahmedabad|Surat|Jaipur|Lucknow|Kanpur|Nagpur|Indore|Thane|Bhopal|Visakhapatnam|Pimpri-Chinchwad|Patna|Vadodara|Ghaziabad|Ludhiana|Agra|Nashik|Faridabad|Meerut|Rajkot|Varanasi|Srinagar|Aurangabad|Dhanbad|Amritsar|Navi Mumbai|Allahabad|Ranchi|Howrah|Coimbatore|Jabalpur|Gwalior|Vijayawada|Jodhpur|Madurai|Raipur|Kota|Guwahati|Chandigarh|Solapur|Hubli|Tiruchirappalli|Bareilly|Moradabad|Mysore|Tiruppur|Gurgaon|Gurugram|Noida|Jalandhar|Bhubaneswar|Salem|Warangal|Guntur|Bhiwandi|Saharanpur|Gorakhpur|Bikaner|Amravati|Jamshedpur|Bhilai|Cuttack|Firozabad|Kochi|Bhavnagar|Dehradun|Durgapur|Asansol|Nanded|Kolhapur|Ajmer|Gulbarga|Jamnagar|Ujjain|Loni|Siliguri|Jhansi|Ulhasnagar|Nellore|Jammu|Sangli|Belgaum|Mangalore|Ambattur|Tirunelveli|Malegaon|Gaya|Jalgaon|Udaipur|Maheshtala)\b/i);
+  if (cityMatch) city = cityMatch[1];
+
   const ignorePatterns = [
     /^gps\s*map\s*camera/i,
     /^note\s*:/i,
     /^lat\b/i,
+    /^latitude/i,
+    /^long\b/i,
+    /^longitude/i,
     /^google\b/i,
     /^\d{1,2}\/\d{1,2}\/\d{4}/,
     /^\d{4}-\d{2}-\d{2}/,
-    /^(mon|tue|wed|thu|fri|sat|sun)/i
+    /^(mon|tue|wed|thu|fri|sat|sun)/i,
+    /^gmt\+[0-9:\.]+/i,
+    /captured\s*by/i
   ];
 
-  const addressLines = [];
+  const addressKeywords = [
+    'india', 'road', 'rd', 'street', 'st', 'marg', 'path', 'gali', 'lane', 'drive',
+    'nagar', 'colony', 'vihar', 'khera', 'enclave', 'pur', 'puri', 'gram', 'gaon',
+    'phase', 'sector', 'block', 'pocket', 'plot', 'h.no', 'house', 'flat', 'bldg',
+    'building', 'floor', 'tower', 'complex', 'plaza', 'estate', 'midc', 'cidco',
+    'industrial', 'area', 'park', 'society', 'chawl', 'layout', 'chowk', 'bazar',
+    'bazaar', 'market', 'mandi', 'near', 'opp', 'opposite', 'behind', 'beside',
+    'ludhiana', 'delhi', 'pune', 'mumbai', 'satara', 'okhla', 'kothrud', 'godoli',
+    'chinchwad', 'salapur', 'sekhar', 'chandra', 'saheed', 'gurugram', 'gurgaon',
+    'noida', 'ghaziabad', 'faridabad', 'hyundai', 'maruti', 'tata', 'mahindra',
+    'toyota', 'kia', 'honda', 'hero', 'eicher', 'ashok'
+  ];
+
+  const primaryAddressLines = [];
+  const fallbackAddressLines = [];
   const otherTextLines = [];
 
-  for (const line of lines) {
-    if (ignorePatterns.some(p => p.test(line))) continue;
+  for (let rawLine of rawLines) {
+    const cleaned = cleanLineNoise(rawLine);
+    if (!cleaned) continue;
 
-    const lower = line.toLowerCase();
+    // Skip pure metadata lines (Lat, Long, Dates, Branding)
+    if (ignorePatterns.some(p => p.test(cleaned))) continue;
+
+    const lower = cleaned.toLowerCase();
     const isAddressy = (
-      /\b\d{6}\b/.test(line) ||
-      lower.includes('india') ||
-      lower.includes('road') || lower.includes('rd') ||
-      lower.includes('street') || lower.includes('st') ||
-      lower.includes('nagar') || lower.includes('colony') ||
-      lower.includes('phase') || lower.includes('sector') ||
-      lower.includes('block') || lower.includes('center') ||
-      lower.includes('cidco') || lower.includes('chinchwad') ||
-      lower.includes('ludhiana') || lower.includes('delhi') ||
-      lower.includes('pune') || lower.includes('mumbai') ||
-      lower.includes('satara') || lower.includes('okhla') ||
-      lower.includes('estate') || lower.includes('midc') ||
-      lower.includes('kothrud') || lower.includes('subhash') ||
-      lower.includes('park') || lower.includes('janta') ||
-      lower.includes('chowk') || lower.includes('godoli') ||
-      lower.includes('hyundai') || lower.includes('maruti') ||
-      lower.includes('tata') || lower.includes('mahindra') ||
-      lower.includes('toyota') || lower.includes('kia') ||
-      lower.includes('honda') || lower.includes('hero') ||
-      lower.includes('eicher') || lower.includes('ashok')
+      /\b\d{6}\b/.test(cleaned) ||
+      addressKeywords.some(kw => new RegExp(`\\b${kw}\\b`, 'i').test(lower))
     );
 
     if (isAddressy) {
-      addressLines.push(line);
-    } else if (line.length > 3) {
-      otherTextLines.push(line);
+      primaryAddressLines.push(cleaned);
+    } else if (cleaned.length > 3) {
+      fallbackAddressLines.push(cleaned);
     }
   }
 
-  let fullAddress = addressLines.join(', ').replace(/,+/g, ',').replace(/\s+/g, ' ').trim();
-  vehicleText = otherTextLines.join(' | ').slice(0, 100);
+  // Use primary matching lines if sufficient, else fallback to all non-metadata lines
+  const finalLines = (primaryAddressLines.join(' ').length >= 10) 
+    ? primaryAddressLines 
+    : [...primaryAddressLines, ...fallbackAddressLines];
+
+  let fullAddress = finalLines.join(', ').replace(/,+/g, ',').replace(/\s+/g, ' ').trim();
+  vehicleText = fallbackAddressLines.join(' | ').slice(0, 100);
 
   return { fullAddress, city, state, pincode, latitude, longitude, dateTime, vehicleText };
 }
 
 export async function extractAddressFromImageBuffer(buffer, worker) {
-  // 1. Bottom 35% crop (geotag zone) - quickest and cleanest for watermarks
   let text = '';
+  let parsed = { fullAddress: '', city: '', state: '', pincode: '', latitude: '', longitude: '', dateTime: '', vehicleText: '' };
+  
   try {
     const meta = await sharp(buffer).rotate().metadata();
     const bH = Math.round((meta.height || 1000) * 0.35);
     const bTop = (meta.height || 1000) - bH;
-    const bBuf = await sharp(buffer)
+
+    // 1a. Try right 75% bottom crop (removes left map box from GPS Map Camera watermarks)
+    const leftOffset = Math.round((meta.width || 1000) * 0.25);
+    const cropW = (meta.width || 1000) - leftOffset;
+    const bBufRight = await sharp(buffer)
       .rotate()
-      .extract({ left: 0, top: bTop, width: meta.width || 1000, height: bH })
+      .extract({ left: leftOffset, top: bTop, width: cropW, height: bH })
       .greyscale()
       .normalize()
       .toBuffer();
-    const bRes = await worker.recognize(bBuf);
-    text = bRes.data.text.trim();
-  } catch (e) {}
+    const bResRight = await worker.recognize(bBufRight);
+    const parsedRight = cleanAddressText(bResRight.data.text);
 
-  let parsed = cleanAddressText(text);
+    if (parsedRight.fullAddress && parsedRight.fullAddress.length > 10) {
+      parsed = parsedRight;
+      text = bResRight.data.text.trim();
+    } else {
+      // 1b. Fallback to full width bottom crop
+      const bBufFull = await sharp(buffer)
+        .rotate()
+        .extract({ left: 0, top: bTop, width: meta.width || 1000, height: bH })
+        .greyscale()
+        .normalize()
+        .toBuffer();
+      const bResFull = await worker.recognize(bBufFull);
+      parsed = cleanAddressText(bResFull.data.text);
+      text = bResFull.data.text.trim();
+    }
+  } catch (e) {}
 
   // 2. If bottom crop didn't get enough address, try full image
   if (!parsed.fullAddress || parsed.fullAddress.length < 10) {
@@ -234,6 +289,6 @@ async function testFast() {
   console.log(`Success Rate: ${rate}%\n`);
 }
 
-if (process.argv[1].endsWith('test_fast_address.js')) {
+if (process.argv[1]?.endsWith('test_fast_address.js')) {
   testFast().catch(console.error);
 }
