@@ -1254,9 +1254,10 @@ app.post("/api/export-address-excel", upload.array("failedImages", 100), async (
 
 
 // ─── CONFIG ───────────────────────────────────────────────
-const BATCH_SIZE = 5;        // files processed in parallel
-const DELAY_BETWEEN_BATCHES = 1000; // ms between batches
-const MAX_RETRIES = 3;
+// Mistral Batch API settings. OCR work is submitted as one asynchronous job,
+// rather than issuing one real-time /v1/ocr call per image.
+const MISTRAL_BATCH_POLL_INTERVAL_MS = Number(process.env.MISTRAL_BATCH_POLL_INTERVAL_MS || 2000);
+const MISTRAL_BATCH_TIMEOUT_MS = Number(process.env.MISTRAL_BATCH_TIMEOUT_MS || 30 * 60 * 1000);
 
 // ─── HELPER: sleep ────────────────────────────────────────
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1301,28 +1302,75 @@ async function uploadFileToMistral(file) {
   }
 }
 
-async function runOcrStage(fileUrl, modelName, stageName, vehicleType = "") {
-  const promptBundle = getVehiclePromptBundle(vehicleType);
-  const promptText = stageName === "ocr3" ? promptBundle.ocr3Prompt : promptBundle.ocr4Prompt;
-  console.log(`[${stageName}] Using ${modelName} for ${promptBundle.label}`);
-  // TODO: inject your vehicle-specific OCR prompt and JSON schema here for the selected Mistral OCR model.
-  console.log(`[${stageName}] Prompt placeholder: ${promptText}`);
+const mistralHeaders = {
+  Authorization: `Bearer ${MISTRAL_API_KEY}`,
+  "Content-Type": "application/json",
+};
 
-  const ocrResponse = await axios.post(
-    "https://api.mistral.ai/v1/ocr",
+async function createMistralOcrBatch(requests) {
+  const response = await axios.post(
+    "https://api.mistral.ai/v1/batch/jobs",
     {
-      model: modelName,
-      document: { type: "document_url", document_url: fileUrl },
+      endpoint: "/v1/ocr",
+      model: OCR_3_MODEL,
+      requests,
+      metadata: { source: "audit2", type: "vehicle_ocr" },
     },
-    {
-      headers: {
-        Authorization: `Bearer ${MISTRAL_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-    }
+    { headers: mistralHeaders }
   );
 
-  return ocrResponse.data.pages?.[0]?.markdown || "";
+  return response.data;
+}
+
+async function waitForMistralBatch(batchJobId) {
+  const deadline = Date.now() + MISTRAL_BATCH_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    // `inline=true` returns inline results when supported and avoids a
+    // separate output-file download for small interactive uploads.
+    const response = await axios.get(
+      `https://api.mistral.ai/v1/batch/jobs/${batchJobId}`,
+      { headers: mistralHeaders, params: { inline: true } }
+    );
+    const batchJob = response.data;
+
+    console.log(
+      `[Mistral batch] ${batchJob.id}: ${batchJob.status} ` +
+      `(${batchJob.completed_requests || 0}/${batchJob.total_requests || 0})`
+    );
+
+    if (batchJob.status === "SUCCESS") return batchJob;
+    if (!["QUEUED", "RUNNING"].includes(batchJob.status)) {
+      const detail = batchJob.errors?.map((error) => error.message).filter(Boolean).join("; ");
+      throw new Error(`Mistral batch ${batchJob.status}${detail ? `: ${detail}` : ""}`);
+    }
+
+    await sleep(MISTRAL_BATCH_POLL_INTERVAL_MS);
+  }
+
+  throw new Error(`Mistral batch ${batchJobId} timed out after ${MISTRAL_BATCH_TIMEOUT_MS}ms`);
+}
+
+async function getMistralBatchOutputs(batchJob) {
+  if (Array.isArray(batchJob.outputs)) return batchJob.outputs;
+  if (!batchJob.output_file) throw new Error("Mistral batch completed without an output file");
+
+  const response = await axios.get(
+    `https://api.mistral.ai/v1/files/${batchJob.output_file}/content`,
+    { headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` }, responseType: "text" }
+  );
+
+  return String(response.data)
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function getOcrTextFromBatchOutput(output) {
+  if (output?.error) return "";
+  const body = output?.response?.body || output?.body || output?.response || output;
+  const pages = body?.pages || body?.data?.pages || [];
+  return pages.map((page) => page?.markdown || "").filter(Boolean).join("\n");
 }
 
 async function detectSkew(normalizedBuffer, vehicleType = "") {
@@ -1566,146 +1614,95 @@ async function cropVehicleWithPercent(buffer, cropPercent = 0.75, vehicleType = 
 
 
 
-async function processOneFile(file, retries = MAX_RETRIES, vehicleType = "", addressDetails = {}) {
-  // Cropping / greyscale / contrast normalization now happens in the rename
-  // module (see /api/process-image) before the file ever reaches this pipeline,
-  // so files are uploaded to Mistral as-is here.
-  let resultData = null;
+function failedExtraction(file, source, error = "") {
+  return { file, aiResult: null, success: false, source, error };
+}
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const fileUrl = await uploadFileToMistral(file);
-      const rawOcrText = await runOcrStage(fileUrl, OCR_3_MODEL, "ocr3", vehicleType);
-      const cleanedOcrText = cleanMarkdown(rawOcrText);
+async function processOcrResult(file, rawOcrText, vehicleType, addressDetails) {
+  const cleanedOcrText = cleanMarkdown(rawOcrText);
+  const llmResult = await extractVehicleDetailsWithAI(cleanedOcrText, vehicleType);
 
-      const llmResult = await extractVehicleDetailsWithAI(cleanedOcrText, vehicleType);
-
-      if (isExtractionSuccessful(llmResult, vehicleType)) {
-        const finalResult = {
-          ...llmResult,
-          address: addressDetails.address || "",
-          city: addressDetails.city || llmResult.city || "",
-          state: addressDetails.state || llmResult.state || "",
-          pincode: addressDetails.pincode || "",
-          country: "",
-        };
-        console.log(`[${file.originalname}] Succeeded using DeepSeek!`);
-        return { file, aiResult: finalResult, success: true, source: "pass_1" };
-      } else {
-        console.log(`[${file.originalname}] Did not find a valid VIN/Chassis number.`);
-        return {
-          file,
-          aiResult: {
-            vin: "",
-            engine_number: "",
-            hmil: "",
-            invoice_number: "",
-            invoice_date: "",
-            grand_total: "",
-            hyp_hps: "",
-            tag: "audit_image",
-            fuel_type: "",
-            address: addressDetails.address || "",
-            city: addressDetails.city || "",
-            state: addressDetails.state || "",
-            pincode: addressDetails.pincode || "",
-            country: "",
-          },
-          success: false,
-          source: "failed"
-        };
-      }
-    } catch (err) {
-      const isLastAttempt = attempt === retries;
-      const status = err.response?.status;
-
-      if (status === 413 || status === 400) {
-        console.error(`[${file.originalname}] Payload error, skipping.`);
-        break;
-      }
-
-      if (isLastAttempt) {
-        console.error(`[${file.originalname}] Attempt ${attempt} failed:`, err.message);
-      } else {
-        const backoff = attempt * 2000;
-        console.warn(`[${file.originalname}] Attempt ${attempt} failed. Retrying in ${backoff}ms...`);
-        await sleep(backoff);
-      }
-    }
+  if (!isExtractionSuccessful(llmResult, vehicleType)) {
+    console.log(`[${file.originalname}] Did not find a valid VIN/Chassis number.`);
+    return failedExtraction(file, "extraction_failed");
   }
 
-  return resultData || { file, aiResult: null, success: false, source: "processing_error" };
+  const finalResult = {
+    ...llmResult,
+    address: addressDetails.address || "",
+    city: addressDetails.city || llmResult.city || "",
+    state: addressDetails.state || llmResult.state || "",
+    pincode: addressDetails.pincode || "",
+    country: "",
+  };
+  console.log(`[${file.originalname}] Succeeded using DeepSeek after Mistral batch OCR.`);
+  return { file, aiResult: finalResult, success: true, source: "mistral_batch" };
 }
 
 // ─── HELPER: run array in batches ─────────────────────────
 async function processBatches(files, onFileProcessed = () => { }, vehicleType = "", addressDetails = {}) {
-  const allResults = [];
+  const results = new Array(files.length);
+  const requests = [];
 
-  for (let i = 0; i < files.length; i += BATCH_SIZE) {
-    const batch = files.slice(i, i + BATCH_SIZE);
-    console.log(`Processing batch ${Math.ceil(i / BATCH_SIZE) + 1} / ${Math.ceil(files.length / BATCH_SIZE)}`);
-
-    const batchResults = await Promise.all(
-      batch.map(async (f) => {
-        const TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes per file
-        let timer;
-        const processingPromise = processOneFile(
-          f,
-          MAX_RETRIES,
-          vehicleType,
-          addressDetails
-        )
-          .then((result) => {
-            clearTimeout(timer);
-
-            // Defensive fallback: processOneFile should never return null,
-            // but prevent one invalid result from breaking the batch.
-            return result || {
-              file: f,
-              aiResult: null,
-              success: false,
-              source: "invalid_result"
-            };
-          })
-          .catch((err) => {
-            clearTimeout(timer);
-
-            console.error(
-              `[Batch] Unexpected processing error for ${f.originalname}:`,
-              err.message
-            );
-
-            // Convert the rejection into a normal failed-file result
-            // so Promise.all() can continue processing the batch.
-            return {
-              file: f,
-              aiResult: null,
-              success: false,
-              source: "processing_exception",
-              error: err.message
-            };
-          });
-
-        const timeoutPromise = new Promise((resolve) => {
-          timer = setTimeout(() => {
-            console.warn(`[Timeout] File ${f.originalname} exceeded ${TIMEOUT_MS}ms`);
-            resolve({ file: f, aiResult: { timeout: "timeout" }, success: false, source: "timeout" });
-          }, TIMEOUT_MS);
-        });
-
-        const result = await Promise.race([processingPromise, timeoutPromise]);
-        onFileProcessed();
-        return result;
-      })
-    );
-    allResults.push(...batchResults);
-
-    if (i + BATCH_SIZE < files.length) {
-      await sleep(DELAY_BETWEEN_BATCHES);
+  // Upload serially so the Files API is not hit with the old five-request burst.
+  for (const [index, file] of files.entries()) {
+    try {
+      const fileUrl = await uploadFileToMistral(file);
+      requests.push({
+        custom_id: String(index),
+        body: {
+          document: { type: "document_url", document_url: fileUrl },
+          include_blocks: false,
+        },
+      });
+    } catch (error) {
+      console.error(`[${file.originalname}] Mistral file upload failed:`, error.message);
+      results[index] = failedExtraction(file, "mistral_upload_error", error.message);
+      onFileProcessed();
     }
   }
 
-  return allResults;
+  if (requests.length === 0) return results;
+
+  try {
+    const createdBatch = await createMistralOcrBatch(requests);
+    console.log(`[Mistral batch] Submitted ${createdBatch.id} for ${requests.length} file(s).`);
+    const completedBatch = await waitForMistralBatch(createdBatch.id);
+    const outputs = await getMistralBatchOutputs(completedBatch);
+    const outputsById = new Map(outputs.map((output) => [String(output.custom_id), output]));
+
+    // DeepSeek remains sequential to avoid moving the rate-limit problem to
+    // the downstream extraction provider.
+    for (const request of requests) {
+      const index = Number(request.custom_id);
+      const file = files[index];
+      const output = outputsById.get(request.custom_id);
+      const rawOcrText = getOcrTextFromBatchOutput(output);
+
+      if (!rawOcrText) {
+        const message = output?.error?.message || "No OCR result returned by Mistral batch";
+        console.error(`[${file.originalname}] ${message}`);
+        results[index] = failedExtraction(file, "mistral_batch_ocr_error", message);
+      } else {
+        try {
+          results[index] = await processOcrResult(file, rawOcrText, vehicleType, addressDetails);
+        } catch (error) {
+          console.error(`[${file.originalname}] Extraction failed:`, error.message);
+          results[index] = failedExtraction(file, "extraction_error", error.message);
+        }
+      }
+      onFileProcessed();
+    }
+  } catch (error) {
+    console.error("[Mistral batch] Job failed:", error.message);
+    for (const request of requests) {
+      const index = Number(request.custom_id);
+      results[index] = failedExtraction(files[index], "mistral_batch_error", error.message);
+      onFileProcessed();
+    }
+  }
+
+  return results;
 }
 
 
@@ -2296,5 +2293,5 @@ app.post(
 
 app.listen(5000, () => console.log("Server running at 5000"));
 
-export { cropVehicleWithPercent, hasGeoLocationWatermark, getPrimaryCropPercent, processOneFile, getVehiclePromptBundle, extractVehicleDetailsWithAI };
+export { cropVehicleWithPercent, hasGeoLocationWatermark, getPrimaryCropPercent, processBatches, getVehiclePromptBundle, extractVehicleDetailsWithAI };
 
