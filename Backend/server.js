@@ -7,11 +7,14 @@ import cors from "cors";
 import morgan from "morgan";
 import OpenAI from "openai";
 import ExcelJS from "exceljs";
-// import path from "path";
+import nodemailer from "nodemailer";
+import { buildAuditReportPdf } from "./reportPdf.js";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { mkdir, writeFile } from "node:fs/promises";
 import { Readable } from "stream";
 import archiver from "archiver";
 import crypto from "crypto";
-// import fs from "fs";
 import sharp from "sharp";
 import { createWorker } from "tesseract.js";
 import { extractAddressFromImageBuffer } from "./test_fast_address.js";
@@ -397,45 +400,82 @@ Return only
       label: "4 Wheeler",
       ocr3Prompt: `You are an OCR extraction engine for Indian passenger vehicles.
 
-Locate the factory identification sticker.
+Perform a complete visual inspection of the entire vehicle image before extracting any information.
+
+Do NOT limit your inspection to the manufacturer sticker.
+
+Carefully inspect:
+
+• Manufacturer sticker
+• Dashboard VIN plate
+• Windshield
+• Rear windshield
+• Glass corners
+• Dashboard area
 
 Extract
 
-VIN Number
+• VIN Number
+• Engine Number (only if explicitly written)
+• Fuel Type
 
-Engine Number (only if explicitly written)
+The VIN may appear in one of two formats.
 
-Fuel Type
+1. Standard manufacturer VIN
+• Exactly 17 alphanumeric characters.
+• Highest priority.
 
-VIN usually follows
+2. Manufacturer glass identification number
+• A standalone sequence of six large individual embossed/plastic digit blocks attached directly to the windshield or rear glass.
+• Usually the only large numeric sequence on the glass.
+• The digits are physically mounted, not printed on paper.
+• They may be black, white, red or another solid color.
+• They may appear through dusty glass, glare or reflections.
+• They may not have any nearby label such as "VIN".
 
-VIN:
+Examples
+
+378517
+378178
 
 Fuel usually appears as
 
 PETROL
-
 DIESEL
-
 CNG
-
 LPG
-
 EV
 
 Normalize
 
 1CNG → CNG
 
+Extraction Priority
+
+1. Extract the 17-character VIN if present.
+2. Otherwise extract the six-digit manufacturer glass identification number.
+3. Return exactly what is visible.
+
 Rules
 
-Return the VIN exactly as printed.
+• Never reconstruct missing characters.
+• Never merge multiple values.
+• Never use barcode values.
+• Ignore QR codes.
+• Ignore Body Number.
+• Ignore Chassis Number unless explicitly labeled VIN.
+• Ignore Dealer stickers.
+• Ignore GPS overlay.
+• Ignore timestamps.
+• Ignore random serial numbers.
 
-Never reconstruct missing characters.
+Before answering verify
 
-Never use barcode values.
-
-Ignore every other identifier.
+✓ Manufacturer sticker inspected
+✓ Windshield inspected
+✓ Rear windshield inspected
+✓ Dashboard inspected
+✓ Six-digit physical digit blocks searched
 
 Return
 
@@ -446,43 +486,84 @@ Return
 }`,
       ocr4Prompt: `You are performing an exhaustive OCR inspection.
 
+Search every visible region of the vehicle image before returning an answer.
+
+Inspect
+
+• Manufacturer sticker
+• Dashboard VIN plate
+• Entire windshield
+• Entire rear windshield
+• Glass corners
+• Dashboard
+• Areas partially hidden by reflections or dust
+
 The VIN may be
 
-• covered by a barcode
-• split across two lines
-• printed vertically
-• partially faded
-• near glass markings
+• A standard 17-character VIN.
+• Covered by a barcode.
+• Split across lines.
+• Printed vertically.
+• Partially faded.
+• Near glass markings.
 
-Inspect the complete manufacturer sticker before answering.
+OR
+
+A standalone six-digit manufacturer identification number composed of six large individual embossed/plastic digit blocks attached directly to the windshield or rear glass.
+
+Characteristics of the six-digit identification number
+
+• Large digits
+• Individual physical blocks
+• Mounted directly on glass
+• Usually arranged horizontally
+• May be black on red, white on black, white on transparent, or similar
+• May have no surrounding text
+• May appear through glare or dust
+
+Examples
+
+378517
+378178
 
 Required
 
 VIN Number
-
 Engine Number (explicit only)
-
 Fuel Type
 
-If multiple serial numbers exist
+Extraction Priority
 
-Prefer the value explicitly associated with
-
-VIN
+1. Standard 17-character VIN.
+2. If absent, return the six-digit manufacturer glass identification number.
 
 Ignore
 
 PIO
-
 SPEC
-
 Body Number
-
-Barcode
-
-QR
-
 Dealer Sticker
+Barcode
+QR Code
+GPS overlay
+Timestamp
+Random serial numbers
+
+Rules
+
+• Never infer missing digits.
+• Never combine numbers.
+• Never guess hidden characters.
+• Return exactly what is visible.
+• Do not ignore the six-digit glass identification simply because it is not printed on a sticker.
+
+Before returning JSON confirm
+
+✓ Complete windshield inspected
+✓ Complete rear windshield inspected
+✓ Dashboard inspected
+✓ Manufacturer sticker inspected
+✓ Six-digit physical digit blocks searched
 
 Return
 
@@ -493,31 +574,83 @@ Return
 }`,
       llmPrompt: `You are the final visual verification model.
 
-Previous OCR passes were unable to confidently identify
+Previous OCR passes were unable to confidently identify the required information.
+
+Your task is to visually inspect the complete vehicle image.
+
+Do NOT rely only on manufacturer stickers.
+
+Inspect every visible area including
+
+• Dashboard
+• Dashboard VIN plate
+• Manufacturer sticker
+• Windshield
+• Rear windshield
+• Glass corners
+
+Extract
 
 VIN
-
 Engine Number
-
 Fuel Type
 
-Inspect the complete sticker visually.
+VIN Decision Rules
 
-Focus on
+The VIN may be either
 
-VIN field
+1. A standard manufacturer VIN consisting of exactly 17 alphanumeric characters.
 
-Fuel field
+OR
 
-Engine Number field
+2. A standalone six-digit manufacturer identification number composed of six individual embossed/plastic digit blocks physically attached to the windshield or rear glass.
 
-Never use unrelated serial numbers.
+These six digits
 
-Never infer hidden VIN characters.
+• are large and highly visible
+• are mounted directly on the glass
+• are not printed on paper
+• may be photographed through dusty glass
+• may have reflections
+• may not have a nearby "VIN" label
 
-Return empty strings for uncertain values.
+Examples
 
-Return only JSON.`,
+378517
+378178
+
+Extraction Priority
+
+1. Always return the 17-character VIN if it exists.
+2. Otherwise return the six-digit glass identification number.
+3. Return exactly what is visible.
+
+Ignore
+
+• Barcode values
+• QR codes
+• Dealer stickers
+• GPS overlays
+• Image timestamps
+• Body numbers
+• Random serial numbers
+
+Never
+
+• Infer hidden characters.
+• Reconstruct missing digits.
+• Merge multiple numbers.
+• Guess uncertain values.
+
+Before returning verify
+
+✓ Entire windshield inspected
+✓ Entire rear windshield inspected
+✓ Dashboard inspected
+✓ Manufacturer sticker inspected
+✓ Six-digit physical digit blocks searched
+
+Return only valid JSON.`,
       schema: {
         type: "object",
         properties: {
@@ -1052,6 +1185,100 @@ const upload = multer({
 });
 
 const jobStore = new Map();
+const reportsDirectory = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "reports",
+);
+
+async function sendReportEmail(reportBuffer, totalFiles, jobId) {
+  const requiredSettings = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM"];
+  const missingSettings = requiredSettings.filter(
+    (setting) => !process.env[setting]?.trim(),
+  );
+  const recipients = (process.env.KPI_EMAIL_RECIPIENTS || "")
+    .split(",")
+    .map((recipient) => recipient.trim())
+    .filter(Boolean);
+
+  if (recipients.length === 0) missingSettings.push("KPI_EMAIL_RECIPIENTS");
+  if (missingSettings.length > 0) {
+    const message = "Report was created, but email is not configured.";
+    console.warn(
+      `[Report email] Skipping job ${jobId}; missing settings: ${missingSettings.join(", ")}`,
+    );
+    return { status: "skipped", message };
+  }
+
+  const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 465;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    const message = "Report was created, but email settings are invalid.";
+    console.error(`[Report email] Invalid SMTP_PORT for job ${jobId}`);
+    return { status: "failed", message };
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port,
+      secure: port === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 30_000,
+    });
+    const reportDate = new Date().toISOString().slice(0, 10);
+
+    const info = await transporter.sendMail({
+      from: process.env.MAIL_FROM,
+      to: recipients,
+      subject: `Stockyard audit report - ${reportDate}`,
+      text: `The stockyard audit report for ${totalFiles} uploaded image(s) is attached as a PDF. If scans failed, the report includes the failed-image statistics. SMTP acceptance confirms receipt by the mail server, not final inbox delivery; check spam/junk if it is missing.`,
+      attachments: [
+        {
+          filename: `Stockyard_Audit_Management_Report_${reportDate}.pdf`,
+          content: reportBuffer,
+          contentType: "application/pdf",
+        },
+      ],
+    });
+
+    const accepted = Array.isArray(info.accepted) ? info.accepted : [];
+    const acceptedAddresses = accepted.map((recipient) =>
+      String(typeof recipient === "string" ? recipient : recipient.address).toLowerCase(),
+    );
+    const rejected = Array.isArray(info.rejected) ? info.rejected : [];
+    const allRecipientsAccepted = recipients.every((recipient) =>
+      acceptedAddresses.includes(recipient.toLowerCase()),
+    );
+    const serverResponse = String(info.response || "").replace(/\s+/g, " ").trim();
+    console.info(
+      `[Report email] SMTP response for job ${jobId}: messageId=${info.messageId || "unavailable"}, accepted=${accepted.length}/${recipients.length}, rejected=${rejected.length}, response=${serverResponse || "unavailable"}`,
+    );
+
+    if (!allRecipientsAccepted) {
+      return {
+        status: "failed",
+        message: `The mail server accepted the report for ${accepted.length} of ${recipients.length} recipient(s). Check backend logs for the SMTP response.`,
+      };
+    }
+
+    return {
+      status: "accepted",
+      message: `The mail server accepted the report for all ${recipients.length} configured recipient(s) (Message-ID: ${info.messageId || "unavailable"}). Check inbox and spam/junk; SMTP acceptance does not confirm inbox delivery.`,
+    };
+  } catch (error) {
+    console.error(`[Report email] Delivery failed for job ${jobId}:`, error);
+    return {
+      status: "failed",
+      message: "Report was created, but email delivery failed. Check backend logs.",
+    };
+  }
+}
+
 app.get("/", (req, res) => {
   return res.json({ message: " Server started at 5000" });
 });
@@ -1745,7 +1972,15 @@ app.get("/api/progress/:jobId", (req, res) => {
   res.flushHeaders();
 
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-  send({ processed: job.processed, total: job.total, status: job.status });
+  send({
+    processed: job.processed,
+    total: job.total,
+    status: job.status,
+    emailStatus: job.emailStatus,
+    emailMessage: job.emailMessage,
+    reportPath: job.reportPath,
+    reportSaveError: job.reportSaveError,
+  });
   job.clients.push(send);
 
   req.on("close", () => {
@@ -1760,8 +1995,8 @@ app.get("/api/result/:jobId", (req, res) => {
   if (job.status === "error") return res.status(500).json({ error: job.error });
   if (job.status !== "done") return res.status(202).json({ status: job.status });
 
-  res.setHeader("Content-Type", "application/zip");
-  res.setHeader("Content-Disposition", "attachment; filename=result.zip");
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", "attachment; filename=Stockyard_Audit_Management_Report.pdf");
   res.send(job.result);
 
   setTimeout(() => jobStore.delete(req.params.jobId), 60_000);
@@ -1771,124 +2006,54 @@ app.get("/api/result/:jobId", (req, res) => {
 async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
   const job = jobStore.get(jobId);
   try {
-    const failedFiles = [];
-    const uniqueVehicles = new Set();
-
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet("Sheet1");
-    worksheet.columns = [
-      { header: "File Name", key: "file_name", width: 12 },
-      { header: "VIN", key: "vin", width: 22 },
-      { header: "Engine Number", key: "engine_number", width: 18 },
-      { header: "HMIL", key: "hmil", width: 10 },
-      { header: "Tag", key: "tag", width: 14 },
-      { header: "Invoice Number", key: "invoice_number", width: 18 },
-      { header: "Invoice Date", key: "invoice_date", width: 14 },
-      { header: "Grand Total", key: "grand_total", width: 14 },
-      { header: "HYP/HPS", key: "hyp_hps", width: 10 },
-      { header: "Address", key: "address", width: 24 },
-      { header: "City", key: "city", width: 14 },
-      { header: "State", key: "state", width: 16 },
-      { header: "Pincode", key: "pincode", width: 12 },
-      { header: "Country", key: "country", width: 12 },
-      { header: "VIN Found", key: "vin_found", width: 12 },
-      { header: "Timeout", key: "timeout", width: 12 },
-    ];
-
-    const headerRow = worksheet.getRow(1);
-    headerRow.eachCell((cell) => {
-      cell.font = { name: "Arial", bold: true, size: 11, color: { argb: "FFFFFFFF" } };
-      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
-      cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
-      cell.border = {
-        top: { style: "thin", color: { argb: "FF000000" } },
-        left: { style: "thin", color: { argb: "FF000000" } },
-        bottom: { style: "thin", color: { argb: "FF000000" } },
-        right: { style: "thin", color: { argb: "FF000000" } },
-      };
-    });
-    headerRow.height = 20;
-
     const notify = () => {
       job.processed++;
       const update = { processed: job.processed, total: job.total, status: "processing" };
       job.clients.forEach((send) => send(update));
     };
 
-    const allResults = await processBatches(files, notify, vehicleType, addressDetails);
-
-    for (const result of allResults) {
-      if (!result) {
-        console.error("[runJob] Invalid null/undefined result detected in allResults");
-        continue;
-      }
-
-      const { file, aiResult, success } = result;
-
-      if (!success || !aiResult) {
-        if (file) failedFiles.push(file);
-        continue;
-      }
-
-      const vin = aiResult.vin?.trim() || "";
-      const normType = normalizeVehicleType(vehicleType);
-      const vinValid = (normType === "commercial_equipment" || normType === "commercial_vehicle")
-        ? (vin.length >= 10 && vin.length <= 17)
-        : (vin.length === 17);
-      if (!vinValid) failedFiles.push(file);
-
-      const engineNumber = String(aiResult.engine_number || "").trim();
-
-      const vehicleKey = `${vin.toLowerCase()}_${engineNumber.toLowerCase()}`;
-      uniqueVehicles.add(vehicleKey);
-
-      const dataRow = worksheet.addRow([
-        file.originalname, aiResult.vin, aiResult.engine_number, aiResult.hmil,
-        aiResult.tag, aiResult.invoice_number, aiResult.invoice_date, aiResult.grand_total,
-        aiResult.hyp_hps, aiResult.address || "", aiResult.city || "", aiResult.state || "", aiResult.pincode || "", aiResult.country || "",
-        vinValid ? "Yes" : "Failed",
-        aiResult.timeout || "",
-      ]);
-
-      const isEven = dataRow.number % 2 === 0;
-      dataRow.eachCell((cell) => {
-        cell.font = { name: "Arial", size: 10 };
-        cell.alignment = { horizontal: "center", vertical: "middle" };
-        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: isEven ? "FFD9E1F2" : "FFFFFFFF" } };
-        cell.border = {
-          top: { style: "thin", color: { argb: "FFB8CCE4" } },
-          left: { style: "thin", color: { argb: "FFB8CCE4" } },
-          bottom: { style: "thin", color: { argb: "FFB8CCE4" } },
-          right: { style: "thin", color: { argb: "FFB8CCE4" } },
-        };
-      });
-
-      const vinCell = dataRow.getCell(15);
-      if (vinValid) {
-        vinCell.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF375623" } };
-        vinCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC6EFCE" } };
-      } else {
-        vinCell.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF9C0006" } };
-        vinCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } };
-      }
+    let allResults;
+    try {
+      allResults = await processBatches(files, notify, vehicleType, addressDetails);
+    } catch (error) {
+      console.error("[runJob] Scan pipeline failed; generating a failed-scan report:", error);
+      allResults = files.map((file) => failedExtraction(file, "job_error", error.message));
+      while (job.processed < job.total) notify();
     }
 
-    const excelBuffer = await workbook.xlsx.writeBuffer();
-
-    const zipBuffer = await new Promise((resolve, reject) => {
-      const archive = archiver("zip", { zlib: { level: 9 } });
-      const buffers = [];
-      archive.on("data", (d) => buffers.push(d));
-      archive.on("end", () => resolve(Buffer.concat(buffers)));
-      archive.on("error", reject);
-      archive.append(excelBuffer, { name: "vehicles.xlsx" });
-      failedFiles.forEach((f) => archive.append(f.buffer, { name: `failed/${f.originalname}` }));
-      archive.finalize();
+    const reportPdf = await buildAuditReportPdf({
+      results: allResults,
+      totalImages: job.total,
+      vehicleType,
+      location: addressDetails.city || addressDetails.address || addressDetails.state,
     });
 
-    job.result = zipBuffer;
+    job.result = reportPdf;
+    const reportTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    job.reportFileName = `Stockyard_Audit_Management_Report_${reportTimestamp}_${jobId.slice(0, 8)}.pdf`;
+    try {
+      await mkdir(reportsDirectory, { recursive: true });
+      await writeFile(path.join(reportsDirectory, job.reportFileName), reportPdf, { flag: "wx" });
+      job.reportPath = path.join("reports", job.reportFileName);
+      console.info(`[runJob] Report saved to ${job.reportPath}`);
+    } catch (error) {
+      job.reportSaveError = "The report was generated but could not be saved to the reports folder.";
+      console.error(`[runJob] Failed to save report for job ${jobId}:`, error);
+    }
+
+    const emailResult = await sendReportEmail(reportPdf, job.total, jobId);
+    job.emailStatus = emailResult.status;
+    job.emailMessage = emailResult.message;
     job.status = "done";
-    job.clients.forEach((send) => send({ processed: job.total, total: job.total, status: "done" }));
+    job.clients.forEach((send) => send({
+      processed: job.total,
+      total: job.total,
+      status: "done",
+      emailStatus: job.emailStatus,
+      emailMessage: job.emailMessage,
+      reportPath: job.reportPath,
+      reportSaveError: job.reportSaveError,
+    }));
   } catch (error) {
     console.error("runJob error:", error);
     job.status = "error";
@@ -2294,4 +2459,3 @@ app.post(
 app.listen(5000, () => console.log("Server running at 5000"));
 
 export { cropVehicleWithPercent, hasGeoLocationWatermark, getPrimaryCropPercent, processBatches, getVehiclePromptBundle, extractVehicleDetailsWithAI };
-

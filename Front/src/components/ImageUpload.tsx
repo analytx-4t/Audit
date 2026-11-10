@@ -9,7 +9,13 @@ const Backend = import.meta.env.VITE_BACKEND || "http://localhost:5000";
 function ImageUpload() {
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<{ processed: number; total: number } | null>(null);
-  const [excelBlob, setExcelBlob] = useState<Blob | null>(null);
+  const [reportBlob, setReportBlob] = useState<Blob | null>(null);
+  const [emailNotice, setEmailNotice] = useState<{
+    status: string;
+    message: string;
+    reportPath?: string;
+    reportSaveError?: string;
+  } | null>(null);
   const [filesMap, setFilesMap] = useState<Record<number, File[]>>({});
   const [selectedVehicleType, setSelectedVehicleType] = useState("");
   const [address, setAddress] = useState("");
@@ -44,7 +50,8 @@ function ImageUpload() {
       return;
     }
     setLoading(true);
-    setExcelBlob(null);
+    setReportBlob(null);
+    setEmailNotice(null);
     setProgress(null);
     try {
       // Step 1: Upload files, receive a job ID immediately
@@ -70,7 +77,16 @@ function ImageUpload() {
           const data = JSON.parse(e.data);
           if (data.status === "error") { es.close(); reject(new Error(data.error || "Processing failed")); return; }
           setProgress({ processed: data.processed, total: data.total });
-          if (data.status === "done") { es.close(); resolve(); }
+          if (data.status === "done") {
+            setEmailNotice({
+              status: data.emailStatus,
+              message: data.emailMessage,
+              reportPath: data.reportPath,
+              reportSaveError: data.reportSaveError,
+            });
+            es.close();
+            resolve();
+          }
         };
         es.onerror = () => { es.close(); reject(new Error("Connection lost during processing")); };
       });
@@ -78,7 +94,7 @@ function ImageUpload() {
       // Step 3: Fetch the finished zip
       const resultRes = await fetch(`${Backend}/api/result/${jobId}`);
       if (!resultRes.ok) throw new Error("Failed to download result");
-      setExcelBlob(await resultRes.blob());
+      setReportBlob(await resultRes.blob());
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Something went wrong";
       alert(msg);
@@ -89,11 +105,11 @@ function ImageUpload() {
   };
 
   const handleDownload = () => {
-    if (!excelBlob) return;
-    const url = window.URL.createObjectURL(excelBlob);
+    if (!reportBlob) return;
+    const url = window.URL.createObjectURL(reportBlob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "result.zip";
+    a.download = "Stockyard_Audit_Management_Report.pdf";
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -219,7 +235,7 @@ function ImageUpload() {
           </div>
         </div>
 
-        {(files.length > 0 || excelBlob) && (
+        {(files.length > 0 || reportBlob) && (
           <div className="flex justify-center gap-3 mt-2">
             {files.length > 0 && (
               <button
@@ -237,7 +253,7 @@ function ImageUpload() {
               </button>
             )}
 
-            {excelBlob && !loading && (
+            {reportBlob && !loading && (
               <button
                 onClick={handleDownload}
                 className="flex items-center gap-2 px-6 py-3 rounded-xl
@@ -247,8 +263,29 @@ function ImageUpload() {
                   transition-all duration-150 active:scale-[0.98] hover:-translate-y-0.5"
               >
                 <Download className="w-4 h-4" />
-                Download Zip
+                Download PDF Report
               </button>
+            )}
+          </div>
+        )}
+
+        {emailNotice && (
+          <div role="status" className="mt-3 text-center text-sm">
+            <p className={emailNotice.status === "accepted"
+              ? "text-emerald-600 dark:text-emerald-400"
+              : "text-amber-600 dark:text-amber-400"}
+            >
+              {emailNotice.message}
+            </p>
+            {emailNotice.reportPath && (
+              <p className="mt-1 text-gray-500 dark:text-gray-400">
+                Saved report: {emailNotice.reportPath}
+              </p>
+            )}
+            {emailNotice.reportSaveError && (
+              <p className="mt-1 text-red-600 dark:text-red-400">
+                {emailNotice.reportSaveError}
+              </p>
             )}
           </div>
         )}
@@ -258,7 +295,7 @@ function ImageUpload() {
         </p>
       </main>
 
-      {excelBlob && <ExcelUpload />}
+      {reportBlob && <ExcelUpload />}
     </div>
   );
 }
