@@ -9,6 +9,10 @@ import OpenAI from "openai";
 import ExcelJS from "exceljs";
 import nodemailer from "nodemailer";
 import { buildAuditReportPdf } from "./reportPdf.js";
+import {
+  recordTemporaryMailReport,
+  startTemporaryMailScheduler,
+} from "./temprory mail/scheduler.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -2029,6 +2033,15 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
     });
 
     job.result = reportPdf;
+    try {
+      await recordTemporaryMailReport({
+        jobId,
+        totalFiles: job.total,
+        reportBuffer: reportPdf,
+      });
+    } catch (error) {
+      console.error(`[Temporary mail] Could not queue report for job ${jobId}:`, error);
+    }
     const reportTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
     job.reportFileName = `Stockyard_Audit_Management_Report_${reportTimestamp}_${jobId.slice(0, 8)}.pdf`;
     try {
@@ -2456,6 +2469,7 @@ app.post(
   },
 );
 
+startTemporaryMailScheduler();
 app.listen(5000, () => console.log("Server running at 5000"));
 
 export { cropVehicleWithPercent, hasGeoLocationWatermark, getPrimaryCropPercent, processBatches, getVehiclePromptBundle, extractVehicleDetailsWithAI };
