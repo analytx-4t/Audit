@@ -238,6 +238,7 @@ export function startTemporaryMailScheduler() {
   if (schedulerStarted) return;
   schedulerStarted = true;
 
+  getScheduleFormatter();
   console.info(
     `[Temporary mail] Daily delivery enabled for 9:00 AM (${scheduleTimezone})`,
   );
