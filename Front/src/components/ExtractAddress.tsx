@@ -54,7 +54,11 @@ export default function ExtractAddress() {
   // Add files to selection
   const handleAddFiles = useCallback((filesList: FileList | null) => {
     if (!filesList) return;
-    const valid = Array.from(filesList).filter((f) => f.type.startsWith("image/"));
+    const isImage = (f: File) =>
+      f.type.startsWith("image/") || /\.(jpe?g|png|webp|heic|heif|tiff?|bmp)$/i.test(f.name);
+    const valid = Array.from(filesList).filter(isImage);
+    const skipped = filesList.length - valid.length;
+    if (skipped > 0) alert(`${skipped} file(s) were skipped because they are not images.`);
     if (!valid.length) return;
 
     setSelectedFiles((prev) => [...prev, ...valid]);
@@ -298,7 +302,7 @@ export default function ExtractAddress() {
             <input
               ref={fileInputRef}
               type="file"
-              accept="image/*"
+              accept="image/*,.heic,.heif"
               multiple
               className="hidden"
               onChange={(e) => handleAddFiles(e.target.files)}

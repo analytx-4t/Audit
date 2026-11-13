@@ -20,7 +20,7 @@ const Login: React.FC = () => {
       const loginArray = JSON.parse(import.meta.env.VITE_LOGIN_USERS || "[]");
 
       const user = loginArray.find(
-        (u: any) => u.email === email && u.password === password
+        (u: { email: string; password: string; role: string }) => u.email === email && u.password === password
       );
 
       if (!user) {
@@ -34,7 +34,7 @@ const Login: React.FC = () => {
 
       toast.success("Login successful!");
       navigate("/");
-    } catch (err: any) {
+    } catch {
       toast.error("Login failed. Please try again.");
     } finally {
       setLoading(false);

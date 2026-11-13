@@ -11,11 +11,12 @@ import nodemailer from "nodemailer";
 import { buildAuditReportPdf } from "./reportPdf.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { Readable } from "stream";
 import archiver from "archiver";
 import crypto from "crypto";
 import sharp from "sharp";
+import heicConvert from "heic-convert";
 import { createWorker } from "tesseract.js";
 import { extractAddressFromImageBuffer } from "./test_fast_address.js";
 
@@ -45,7 +46,11 @@ const openai = new OpenAI({
 });
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
-const OCR_3_MODEL = process.env.MISTRAL_OCR_3_MODEL || "mistral-ocr-latest";
+// Pin the OCR model. "mistral-ocr-latest" is a moving alias (it now resolves to
+// OCR 4.1), which silently changed extraction behaviour without a code change.
+const OCR_3_MODEL = process.env.MISTRAL_OCR_3_MODEL || "mistral-ocr-2512";
+// Vision chat model used as a last-resort reader when OCR text has no valid VIN.
+const VISION_MODEL = process.env.MISTRAL_VISION_MODEL || "mistral-medium-latest";
 const STICKER_ONLY_INSTRUCTION = "The input is a close-up image of a vehicle identification sticker or manufacturer plate. Ignore unrelated scene content, geotagged metadata, and any non-sticker text. Extract only the requested identification fields.";
 
 let tesseractWorker = null;
@@ -969,11 +974,7 @@ function extractVehicleDetailsFromText(text = "", vehicleType = "") {
 }
 
 function isExtractionSuccessful(result = {}, vehicleType = "") {
-  const vin = String(result.vin || "").trim();
-  const engineNumber = String(result.engine_number || "").trim();
-  const normType = normalizeVehicleType(vehicleType);
-  const minVinLen = (normType === "commercial_equipment" || normType === "commercial_vehicle") ? 10 : 17;
-  return Boolean((vin.length >= minVinLen && vin.length <= 17) || engineNumber);
+  return isPlausibleVin(result.vin, vehicleType);
 }
 
 function normalizeOcrStructuredOutput(text = "") {
@@ -1024,64 +1025,62 @@ function postProcessVin(vin, vehicleType = "") {
   const normType = normalizeVehicleType(vehicleType);
 
   if (normType === "commercial_equipment" || normType === "commercial_vehicle") {
-    if (v.length >= 10 && v.length <= 17) return v;
+    if (v.length >= 10 && v.length < 17) return v;
+    // 17-character commercial VINs still follow ISO 3779 (no I/O/Q).
+    if (v.length === 17) return v.replace(/[IOQ]/g, (ch) => ({ I: "1", O: "0", Q: "0" })[ch]);
+  }
+
+  // Stamped chassis numbers are often framed by marker symbols (Honda prints
+  // "◻ME4KC407KSG178774◻"), which readers turn into an extra leading/trailing
+  // character ("MME4…", "…178774D"). Drop it when that yields a valid VIN.
+  if (v.length === 18 || v.length === 19) {
+    // Keep a real leading "M" (Indian WMI) unless the read starts with a doubled "MM".
+    const keepHead = v[0] === "M" && v[1] !== "M";
+    const trims = v.length === 18
+      ? (keepHead ? [v.slice(0, 17), v.slice(1)] : [v.slice(1), v.slice(0, 17)])
+      : (keepHead ? [v.slice(0, 17), v.slice(1, 18)] : [v.slice(1, 18), v.slice(2), v.slice(0, 17)]);
+    const fixed = trims.map((t) => postProcessVin(t, vehicleType)).find((t) => isPlausibleVin(t, vehicleType));
+    if (fixed) return fixed;
   }
 
   if (v.length !== 17) return v.length >= 10 ? v : "";
 
-  let c = v.split("");
+  // Only apply corrections that are guaranteed by the VIN standard (ISO 3779),
+  // never per-model guesses: the old hardcoded prefix/whole-VIN rewrites mapped
+  // different vehicles onto the same fixed VIN.
+  const c = v.split("");
 
-  // 1. Pos 1-3 WMI: 'MAS' or 'MAR' -> 'MA3' for Maruti
-  if (c[0] === "M" && c[1] === "A") {
-    if (c[2] === "S" || c[2] === "B" || c[2] === "R") c[2] = "3";
+  // I, O and Q are never used in a VIN.
+  const illegal = { I: "1", O: "0", Q: "0" };
+  for (let i = 0; i < 17; i++) {
+    if (illegal[c[i]]) c[i] = illegal[c[i]];
   }
 
-  if (c[0] === "M" && c[1] === "A" && c[2] === "3") {
-    // Pos 4 (Index 3): '8' -> 'B' (e.g. MA38NC -> MA3BNC)
-    if (c[3] === "8") c[3] = "B";
-
-    // Pos 8 (Index 7): '5' -> 'S' (e.g. MA3BNC725TFD -> MA3BNC72STFD)
-    if (c[7] === "5") c[7] = "S";
-
-    // Pos 9 (Index 8): '5' -> 'S'
-    if (c[8] === "5") c[8] = "S";
-
-    // Known Model Code Restorations from OCR noise:
-    if (v.startsWith("MA3ZPDCS")) { c[4] = "F"; c[5] = "D"; c[6] = "F"; c[7] = "S"; }
-    if (v.startsWith("MA3ZFPFS")) { c[4] = "F"; c[5] = "D"; c[6] = "F"; c[7] = "S"; }
-    if (v.startsWith("MASTIDE") || v.startsWith("MA3STIDE")) {
-      c[1] = "A"; c[2] = "3"; c[3] = "Z"; c[4] = "F"; c[5] = "D"; c[6] = "F"; c[7] = "S";
-    }
-    if (v.startsWith("MA3ZFDES")) { c[6] = "F"; }
-    if (v.startsWith("MA3SENG1")) { c[3] = "S"; c[4] = "F"; c[5] = "M"; c[6] = "6"; c[7] = "1"; }
-    if (v === "MA3ZFDFSKTG515152") return "MA3SFM61STF515152";
-    if (v === "MARJOTURWTEC24605" || v.startsWith("MA3JOTUR")) return "MA3JDT08WTEG24605";
+  // Positions 14-17 (serial tail) are numeric for passenger cars and two-wheelers.
+  const toDigit = { S: "5", B: "8", D: "0", L: "1", Z: "2", G: "6", T: "7" };
+  for (let i = 13; i < 17; i++) {
+    if (toDigit[c[i]]) c[i] = toDigit[c[i]];
   }
 
-  // 2. Pos 10 (Model Year - Index 9) MUST BE A LETTER (e.g. S, T, R, P, N)
-  if (/[0-9]/.test(c[9])) {
-    if (c[9] === "5") c[9] = "S";
-    else if (c[9] === "8") c[9] = "B";
-    else if (c[9] === "0") c[9] = "O";
-  }
+  // Indian WMIs are "M" + a letter (MA1, MAT, MBL, MD6, ME4, MZB ...): the
+  // second character is never a digit (e.g. TVS "M0626..." is "MD626...").
+  const toLetter = { 0: "D", 8: "B", 5: "S", 2: "Z", 6: "G" };
+  if (c[0] === "M" && toLetter[c[1]]) c[1] = toLetter[c[1]];
 
-  // 3. Last 5 digits (Indices 12 to 16) MUST BE DIGITS (0-9)
-  for (let i = 12; i < 17; i++) {
-    if (/[A-Z]/.test(c[i])) {
-      if (c[i] === "S") c[i] = "5";
-      else if (c[i] === "B") c[i] = "8";
-      else if (c[i] === "O" || c[i] === "Q" || c[i] === "D") c[i] = "0";
-      else if (c[i] === "I" || c[i] === "L") c[i] = "1";
-      else if (c[i] === "Z") c[i] = "2";
-      else if (c[i] === "G") c[i] = "6";
-    }
-  }
-
-  if (v.startsWith("MASTIDE") || v.startsWith("MA3STIDE")) {
-    c[16] = "3";
-  }
+  // Position 10 is the model-year code; "5" is a common misread of "S" (2025).
+  if (c[9] === "5") c[9] = "S";
 
   return c.join("");
+}
+
+function isPlausibleVin(vin = "", vehicleType = "") {
+  const v = String(vin).trim().toUpperCase();
+  const normType = normalizeVehicleType(vehicleType);
+  if (normType === "commercial_equipment" || normType === "commercial_vehicle") {
+    return /^[A-Z0-9]{10,17}$/.test(v) && /\d/.test(v);
+  }
+  // 17 chars, no I/O/Q, has both letters and digits, serial tail numeric.
+  return /^[A-HJ-NPR-Z0-9]{17}$/.test(v) && /[A-Z]/.test(v) && /^\d{4}$/.test(v.slice(13));
 }
 
 async function extractVehicleDetailsWithAI(text, vehicleType = "") {
@@ -1089,7 +1088,7 @@ async function extractVehicleDetailsWithAI(text, vehicleType = "") {
   const vehicleContext = vehicleType ? `\nVehicle type context: ${promptBundle.label}. Use this context to interpret the document and extract the correct VIN-related details.\n` : "";
 
   try {
-    const response = await openai.chat.completions.create({
+    const response = await withRetry("DeepSeek", () => openai.chat.completions.create({
       model: "deepseek-chat",
       response_format: { type: "json_object" },
       messages: [
@@ -1105,9 +1104,13 @@ SYNONYMS & LABELS:
 
 STRICT RULES FOR VIN (CHASSIS NUMBER):
 - For passenger/two-wheelers, a valid Indian VIN is 17 characters long. For commercial equipment/tractors/commercial vehicles, a chassis serial / VIN is typically 10 to 17 characters long (e.g., 1VY5210EASB045343, 1PY5310ECTC072100, 5310EASA028920).
-- It never contains spaces, hyphens, or special characters.
-- Carefully extract the exact core alphanumeric VIN or chassis serial sequence.
-- Never invent/hallucinate a VIN. If no valid sequence is visible in the OCR text, leave "vin" as "".
+- Indian VINs normally start with "M" (e.g. MA3, MA1, MAL, MAT, MBL, ME3, ME4, MD2, MD6, MZB, MAK, MBH).
+- A VIN never contains the letters I, O or Q; if the OCR shows them inside a VIN they are the digits 1, 0, 0.
+- OCR often inserts spaces, line breaks, hyphens, "*" or "#" markers inside a VIN, or splits it across two lines. Join the pieces into one sequence and drop the markers. Do NOT drop or add real characters.
+- HYUNDAI stickers print the VIN in TWO parts: the first 11 characters after "VIN:" (e.g. "MALB141CLTM") and the last 6 digits in large print on the next line next to the fuel type (e.g. "PETROL 454752"). Join them: "MALB141CLTM454752". The same split can occur on other brands' stickers; if a VIN label is followed by 11 characters and a separate 6-digit number on the next line, join them.
+- Prefer the value printed next to a VIN / Chassis / Frame label. If the same VIN appears more than once (label text and sticker print), use the most complete consistent reading.
+- These are NOT the VIN: Body No, barcode digits, Model/Spec/PIO codes, colour codes, part numbers, dealer stickers, GPS/map-camera overlay text (address, pincode, Lat/Long, date, time, "GMT").
+- Copy characters exactly as read. Never invent/hallucinate characters. If no valid sequence is visible in the OCR text, leave "vin" as "".
 
 STRICT RULES FOR ENGINE NUMBER:
 - Extract only if explicitly labelled (e.g., Engine No, ENGINE SERIAL NO, ENGINE SERIAL, ENG NO, E:, etc.). Otherwise leave as "".
@@ -1126,7 +1129,7 @@ Return only valid JSON in the format:
         },
       ],
       temperature: 0,
-    });
+    }));
 
     const parsed = JSON.parse(response.choices[0].message.content || "{}");
     const result = {
@@ -1179,7 +1182,8 @@ Return only valid JSON in the format:
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024,
+    // A single large phone photo must not reject the whole upload.
+    fileSize: Number(process.env.MAX_UPLOAD_MB || 30) * 1024 * 1024,
     files: 1000,
   },
 });
@@ -1191,115 +1195,270 @@ const reportsDirectory = path.resolve(
   "reports",
 );
 
-async function sendReportEmail(reportBuffer, totalFiles, jobId) {
-  const requiredSettings = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM"];
-  const missingSettings = requiredSettings.filter(
-    (setting) => !process.env[setting]?.trim(),
-  );
-  const recipients = (process.env.KPI_EMAIL_RECIPIENTS || "")
-    .split(",")
-    .map((recipient) => recipient.trim())
-    .filter(Boolean);
+// ─── REPORT EMAIL ─────────────────────────────────────────
+// Reliability rules (emails were "sometimes" missing in production):
+//  * transient SMTP errors are retried with backoff;
+//  * anything still undelivered is written to reports/outbox and retried
+//    every MAIL_RETRY_INTERVAL_MIN minutes and on every server start, so a
+//    restart or a mail-server outage no longer loses the report;
+//  * every attempt is appended to reports/mail-log.jsonl for diagnosis;
+//  * dates use REPORT_TIMEZONE (IST by default), not the droplet's UTC clock.
+const REPORT_TIMEZONE = process.env.REPORT_TIMEZONE || "Asia/Kolkata";
+const outboxDirectory = path.join(reportsDirectory, "outbox");
+const mailLogPath = path.join(reportsDirectory, "mail-log.jsonl");
+const MAIL_RETRY_INTERVAL_MS = Number(process.env.MAIL_RETRY_INTERVAL_MIN || 10) * 60 * 1000;
+const MAIL_MAX_OUTBOX_ATTEMPTS = Number(process.env.MAIL_MAX_OUTBOX_ATTEMPTS || 144); // ~24h at 10 min
 
-  if (recipients.length === 0) missingSettings.push("KPI_EMAIL_RECIPIENTS");
-  if (missingSettings.length > 0) {
-    const message = "Report was created, but email is not configured.";
-    console.warn(
-      `[Report email] Skipping job ${jobId}; missing settings: ${missingSettings.join(", ")}`,
-    );
-    return { status: "skipped", message };
-  }
+function reportDateString(date = new Date()) {
+  // en-CA formats as YYYY-MM-DD
+  return new Intl.DateTimeFormat("en-CA", { timeZone: REPORT_TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+}
 
+function reportDateTimeString(date = new Date()) {
+  return new Intl.DateTimeFormat("en-GB", { timeZone: REPORT_TIMEZONE, dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+
+function getMailConfig() {
+  const missing = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM"].filter((key) => !process.env[key]?.trim());
+  const recipients = (process.env.KPI_EMAIL_RECIPIENTS || "").split(",").map((r) => r.trim()).filter(Boolean);
+  if (recipients.length === 0) missing.push("KPI_EMAIL_RECIPIENTS");
   const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 465;
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    const message = "Report was created, but email settings are invalid.";
-    console.error(`[Report email] Invalid SMTP_PORT for job ${jobId}`);
-    return { status: "failed", message };
-  }
+  const portValid = Number.isInteger(port) && port >= 1 && port <= 65535;
+  return { missing, recipients, port, portValid };
+}
 
+function createMailTransport(port) {
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port,
+    secure: port === 465,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    connectionTimeout: 20_000,
+    greetingTimeout: 20_000,
+    socketTimeout: 60_000,
+  });
+}
+
+async function appendMailLog(entry) {
   try {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port,
-      secure: port === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
-      },
-      connectionTimeout: 10_000,
-      greetingTimeout: 10_000,
-      socketTimeout: 30_000,
-    });
-    const reportDate = new Date().toISOString().slice(0, 10);
-
-    const info = await transporter.sendMail({
-      from: process.env.MAIL_FROM,
-      to: recipients,
-      subject: `Stockyard audit report - ${reportDate}`,
-      text: `The stockyard audit report for ${totalFiles} uploaded image(s) is attached as a PDF. If scans failed, the report includes the failed-image statistics. SMTP acceptance confirms receipt by the mail server, not final inbox delivery; check spam/junk if it is missing.`,
-      attachments: [
-        {
-          filename: `Stockyard_Audit_Management_Report_${reportDate}.pdf`,
-          content: reportBuffer,
-          contentType: "application/pdf",
-        },
-      ],
-    });
-
-    const accepted = Array.isArray(info.accepted) ? info.accepted : [];
-    const acceptedAddresses = accepted.map((recipient) =>
-      String(typeof recipient === "string" ? recipient : recipient.address).toLowerCase(),
-    );
-    const rejected = Array.isArray(info.rejected) ? info.rejected : [];
-    const allRecipientsAccepted = recipients.every((recipient) =>
-      acceptedAddresses.includes(recipient.toLowerCase()),
-    );
-    const serverResponse = String(info.response || "").replace(/\s+/g, " ").trim();
-    console.info(
-      `[Report email] SMTP response for job ${jobId}: messageId=${info.messageId || "unavailable"}, accepted=${accepted.length}/${recipients.length}, rejected=${rejected.length}, response=${serverResponse || "unavailable"}`,
-    );
-
-    if (!allRecipientsAccepted) {
-      return {
-        status: "failed",
-        message: `The mail server accepted the report for ${accepted.length} of ${recipients.length} recipient(s). Check backend logs for the SMTP response.`,
-      };
-    }
-
-    return {
-      status: "accepted",
-      message: `The mail server accepted the report for all ${recipients.length} configured recipient(s) (Message-ID: ${info.messageId || "unavailable"}). Check inbox and spam/junk; SMTP acceptance does not confirm inbox delivery.`,
-    };
+    await mkdir(reportsDirectory, { recursive: true });
+    await appendFile(mailLogPath, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
   } catch (error) {
-    console.error(`[Report email] Delivery failed for job ${jobId}:`, error);
-    return {
-      status: "failed",
-      message: "Report was created, but email delivery failed. Check backend logs.",
-    };
+    console.error("[Report email] Could not write mail log:", error.message);
   }
+}
+
+function isTransientMailError(error) {
+  const code = error?.responseCode;
+  if (code && code >= 500) return false; // 5xx = permanent (bad auth, rejected recipient)
+  return true; // network errors, timeouts, 4xx (try again later)
+}
+
+// Sends one message with retries. Returns { status: "accepted" | "failed", message }.
+async function deliverMail(mail, label) {
+  const { recipients, port } = getMailConfig();
+  const delays = (process.env.MAIL_RETRY_DELAYS_MS || "5000,20000,60000").split(",").map(Number);
+  let lastError;
+  for (let attempt = 1; attempt <= delays.length + 1; attempt++) {
+    try {
+      const info = await createMailTransport(port).sendMail({ from: process.env.MAIL_FROM, to: recipients, ...mail });
+      const accepted = (Array.isArray(info.accepted) ? info.accepted : [])
+        .map((r) => String(typeof r === "string" ? r : r.address).toLowerCase());
+      const missingRecipients = recipients.filter((r) => !accepted.includes(r.toLowerCase()));
+      const response = String(info.response || "").replace(/\s+/g, " ").trim();
+      await appendMailLog({ label, attempt, status: missingRecipients.length ? "partial" : "accepted", messageId: info.messageId, accepted, rejected: missingRecipients, response });
+      console.info(`[Report email] ${label}: accepted ${accepted.length}/${recipients.length} on attempt ${attempt} (${info.messageId})`);
+      if (missingRecipients.length) {
+        return { status: "failed", message: `The mail server rejected: ${missingRecipients.join(", ")}.` };
+      }
+      return { status: "accepted", message: `Report emailed to ${recipients.length} recipient(s) at ${reportDateTimeString()} (Message-ID: ${info.messageId || "unavailable"}). Check spam/junk if it is missing.` };
+    } catch (error) {
+      lastError = error;
+      await appendMailLog({ label, attempt, status: "error", code: error.code, responseCode: error.responseCode, error: error.message });
+      console.error(`[Report email] ${label}: attempt ${attempt} failed: ${error.code || ""} ${error.responseCode || ""} ${error.message}`);
+      if (!isTransientMailError(error) || attempt > delays.length) break;
+      await sleep(delays[attempt - 1]);
+    }
+  }
+  return { status: "failed", message: `Email failed: ${lastError?.code || ""} ${lastError?.message || "unknown error"}`.trim(), error: lastError };
+}
+
+async function queueInOutbox(jobId, mail, attachmentBuffer, attachmentName) {
+  await mkdir(outboxDirectory, { recursive: true });
+  const base = `${Date.now()}_${jobId.slice(0, 8)}`;
+  if (attachmentBuffer) await writeFile(path.join(outboxDirectory, `${base}.pdf`), attachmentBuffer);
+  await writeFile(path.join(outboxDirectory, `${base}.json`), JSON.stringify({
+    jobId, subject: mail.subject, text: mail.text, attachmentName, attachmentFile: attachmentBuffer ? `${base}.pdf` : "", attempts: 0, createdAt: new Date().toISOString(),
+  }, null, 2));
+  return base;
+}
+
+let outboxRunning = false;
+async function processMailOutbox() {
+  if (outboxRunning) return;
+  outboxRunning = true;
+  try {
+    const { missing, portValid } = getMailConfig();
+    if (missing.length || !portValid) return;
+    let entries = [];
+    try { entries = (await readdir(outboxDirectory)).filter((name) => name.endsWith(".json")).sort(); } catch { return; }
+    for (const name of entries) {
+      const metaPath = path.join(outboxDirectory, name);
+      const meta = JSON.parse(await readFile(metaPath, "utf8"));
+      if (meta.attempts >= MAIL_MAX_OUTBOX_ATTEMPTS) continue;
+      const attachments = meta.attachmentFile
+        ? [{ filename: meta.attachmentName, content: await readFile(path.join(outboxDirectory, meta.attachmentFile)), contentType: "application/pdf" }]
+        : [];
+      const result = await deliverMail({ subject: meta.subject, text: meta.text, attachments }, `outbox ${meta.jobId}`);
+      if (result.status === "accepted") {
+        await unlink(metaPath).catch(() => { });
+        if (meta.attachmentFile) await unlink(path.join(outboxDirectory, meta.attachmentFile)).catch(() => { });
+        console.info(`[Report email] Delivered queued report for job ${meta.jobId} (queued ${meta.createdAt}).`);
+      } else {
+        meta.attempts += 1;
+        meta.lastError = result.message;
+        await writeFile(metaPath, JSON.stringify(meta, null, 2));
+      }
+    }
+  } catch (error) {
+    console.error("[Report email] Outbox processing failed:", error.message);
+  } finally {
+    outboxRunning = false;
+  }
+}
+
+async function sendReportEmail(reportBuffer, totalFiles, jobId, summary = "") {
+  const { missing, portValid } = getMailConfig();
+  if (missing.length > 0) {
+    console.warn(`[Report email] Skipping job ${jobId}; missing settings: ${missing.join(", ")}`);
+    await appendMailLog({ label: `job ${jobId}`, status: "skipped", missing });
+    return { status: "skipped", message: "Report was created, but email is not configured." };
+  }
+  if (!portValid) {
+    console.error(`[Report email] Invalid SMTP_PORT for job ${jobId}`);
+    return { status: "failed", message: "Report was created, but email settings are invalid (SMTP_PORT)." };
+  }
+
+  const reportDate = reportDateString();
+  const attachmentName = `Stockyard_Audit_Management_Report_${reportDate}.pdf`;
+  const mail = {
+    subject: `Stockyard audit report - ${reportDate}`,
+    text: [
+      `The stockyard audit report for ${totalFiles} uploaded image(s) is attached as a PDF.`,
+      summary,
+      `Generated: ${reportDateTimeString()} (${REPORT_TIMEZONE}).`,
+    ].filter(Boolean).join("\n\n"),
+    attachments: reportBuffer
+      ? [{ filename: attachmentName, content: reportBuffer, contentType: "application/pdf" }]
+      : [],
+  };
+
+  const result = await deliverMail(mail, `job ${jobId}`);
+  if (result.status === "accepted") return result;
+
+  // Permanent failures (e.g. 535 bad password) will not fix themselves, but
+  // still queue so the report goes out once the setting is corrected.
+  try {
+    await queueInOutbox(jobId, mail, reportBuffer, attachmentName);
+    return { status: "queued", message: `${result.message}. The report is queued and will be re-sent automatically every ${Math.round(MAIL_RETRY_INTERVAL_MS / 60000)} min.` };
+  } catch (error) {
+    console.error(`[Report email] Could not queue job ${jobId}:`, error.message);
+    return result;
+  }
+}
+
+// Startup: check SMTP reachability (DigitalOcean blocks SMTP ports on some
+// droplets) and flush anything left in the outbox from before a restart.
+if (process.env.NO_LISTEN !== "1") {
+  setTimeout(async () => {
+    const { missing, port, portValid } = getMailConfig();
+    if (missing.length || !portValid) {
+      console.warn(`[Report email] Email disabled: missing/invalid settings ${missing.join(", ")}`);
+      return;
+    }
+    try {
+      await createMailTransport(port).verify();
+      console.info(`[Report email] SMTP ${process.env.SMTP_HOST}:${port} reachable and login OK.`);
+    } catch (error) {
+      console.error(`[Report email] SMTP check FAILED for ${process.env.SMTP_HOST}:${port}: ${error.code || ""} ${error.message}. ` +
+        "If this server is on DigitalOcean, outbound SMTP ports may be blocked; open a support ticket or use an HTTP email API.");
+    }
+    await processMailOutbox();
+  }, 5_000);
+  setInterval(processMailOutbox, MAIL_RETRY_INTERVAL_MS).unref();
 }
 
 app.get("/", (req, res) => {
   return res.json({ message: " Server started at 5000" });
 });
 
-// ─── RENAME MODULE: crop + greyscale + contrast normalization ─────
-// Same processing that used to run right before OCR now runs here, so the
-// rename step hands off an already-cropped/B&W/contrast-normalized image.
+// ─── RENAME MODULE: OCR-safe image normalization ─────
+// Only lossless-in-meaning steps are applied: EXIF orientation is baked in and
+// oversized photos are downscaled. The previous crop/deskew/greyscale pipeline
+// (cropVehicleWithPercent) is no longer used here: its watermark detector fired
+// on almost every photo (any 6-digit number, "am"/"pm", a year) and cut the
+// bottom 25%, and its rotation guess frequently turned stickers sideways or
+// upside down, which made the OCR swap or drop characters.
+// ─── HEIC/HEIF (iPhone) support ───────────────────────────
+// sharp's prebuilt libvips only decodes AVIF from the HEIF family, so iPhone
+// HEIC photos are converted to JPEG with heic-convert first.
+function isHeicLike(buffer, name = "", mimetype = "") {
+  if (/\.(heic|heif)$/i.test(name) || /hei[cf]/i.test(mimetype)) return true;
+  if (!buffer || buffer.length < 12) return false;
+  if (buffer.toString("ascii", 4, 8) !== "ftyp") return false;
+  const brand = buffer.toString("ascii", 8, 12).toLowerCase();
+  return ["heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1"].includes(brand);
+}
+
+// Returns a buffer sharp can decode: the original, or a JPEG converted from HEIC.
+// Throws if the image cannot be decoded either way.
+async function toDecodableImage(buffer, name = "", mimetype = "") {
+  try {
+    await sharp(buffer).metadata();
+    await sharp(buffer).resize(8).toBuffer(); // metadata alone can succeed on undecodable HEVC
+    return { buffer, converted: false };
+  } catch (sharpError) {
+    if (!isHeicLike(buffer, name, mimetype)) throw sharpError;
+    const jpeg = Buffer.from(await heicConvert({ buffer, format: "JPEG", quality: 0.92 }));
+    return { buffer: jpeg, converted: true };
+  }
+}
+
+async function prepareImageForOcr(buffer, name = "", mimetype = "") {
+  try {
+    const decodable = (await toDecodableImage(buffer, name, mimetype)).buffer;
+    return await sharp(decodable)
+      .rotate() // apply EXIF orientation only
+      .resize({ width: 3000, height: 3000, fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 92 })
+      .toBuffer();
+  } catch (err) {
+    console.error("[prepareImageForOcr] Falling back to original buffer:", err.message);
+    return null;
+  }
+}
+
 app.post("/api/process-image", upload.single("image"), async (req, res) => {
   const file = req.file;
   if (!file) {
     return res.status(400).json({ error: "No image uploaded" });
   }
-  if (!file.mimetype || !file.mimetype.startsWith("image/")) {
+  // Browsers often report HEIC photos with an empty type, so also accept by extension.
+  const looksLikeImage = file.mimetype?.startsWith("image/")
+    || /\.(jpe?g|png|webp|tiff?|bmp|gif|heic|heif|avif)$/i.test(file.originalname || "")
+    || isHeicLike(file.buffer);
+  if (!looksLikeImage) {
     return res.status(400).json({ error: "File is not an image" });
   }
 
   try {
-    const vehicleType = req.body.vehicle_type || req.body.vehicleType || "";
-    const cropPercent = getPrimaryCropPercent(vehicleType);
-    const processedBuffer = await cropVehicleWithPercent(file.buffer, cropPercent, vehicleType);
-    const wasProcessed = true;
+    const processedBuffer = await prepareImageForOcr(file.buffer, file.originalname, file.mimetype);
+    if (!processedBuffer) {
+      // Could not decode: hand the original back unchanged (not marked processed).
+      res.setHeader("Content-Type", file.mimetype || "application/octet-stream");
+      res.setHeader("X-Image-Processed", "false");
+      return res.send(file.buffer);
+    }
 
     res.setHeader("Content-Type", "image/jpeg");
     res.setHeader("X-Image-Processed", "true");
@@ -1555,10 +1714,10 @@ async function waitForMistralBatch(batchJobId) {
   while (Date.now() < deadline) {
     // `inline=true` returns inline results when supported and avoids a
     // separate output-file download for small interactive uploads.
-    const response = await axios.get(
+    const response = await withRetry("Mistral batch poll", () => axios.get(
       `https://api.mistral.ai/v1/batch/jobs/${batchJobId}`,
       { headers: mistralHeaders, params: { inline: true } }
-    );
+    ));
     const batchJob = response.data;
 
     console.log(
@@ -1845,89 +2004,452 @@ function failedExtraction(file, source, error = "") {
   return { file, aiResult: null, success: false, source, error };
 }
 
-async function processOcrResult(file, rawOcrText, vehicleType, addressDetails) {
-  const cleanedOcrText = cleanMarkdown(rawOcrText);
-  const llmResult = await extractVehicleDetailsWithAI(cleanedOcrText, vehicleType);
+// ─── Resilience helpers ───────────────────────────────────
+// The batch rewrite dropped all retries, so a single 429/5xx from Mistral or
+// DeepSeek sent a perfectly readable image straight to the failed list.
+const MAX_RETRIES = Number(process.env.OCR_MAX_RETRIES || 4);
+const OCR_MODE = (process.env.MISTRAL_OCR_MODE || "auto").toLowerCase(); // "auto" | "batch" | "realtime"
 
-  if (!isExtractionSuccessful(llmResult, vehicleType)) {
-    console.log(`[${file.originalname}] Did not find a valid VIN/Chassis number.`);
-    return failedExtraction(file, "extraction_failed");
+function isRetryableError(err) {
+  const status = err?.response?.status ?? err?.status;
+  if (!status) return true; // network error / timeout
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+async function withRetry(label, fn, attempts = MAX_RETRIES) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const status = err?.response?.status ?? err?.status;
+      if (attempt === attempts || !isRetryableError(err)) break;
+      const retryAfter = Number(err?.response?.headers?.["retry-after"]);
+      const backoff = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : Math.min(2000 * 2 ** (attempt - 1), 20000);
+      console.warn(`[${label}] attempt ${attempt} failed (${status || err.message}); retrying in ${backoff}ms`);
+      await sleep(backoff);
+    }
+  }
+  throw lastError;
+}
+
+function isAccountError(err) {
+  const status = err?.response?.status ?? err?.status;
+  return status === 401 || status === 402 || status === 403;
+}
+
+function describeError(err) {
+  const status = err?.response?.status ?? err?.status;
+  const detail = err?.response?.data?.message || err?.response?.data?.detail || err?.message || String(err);
+  return status ? `HTTP ${status}: ${typeof detail === "string" ? detail : JSON.stringify(detail)}` : detail;
+}
+
+function toOcrDocument(url, mimetype = "") {
+  return mimetype === "application/pdf"
+    ? { type: "document_url", document_url: url }
+    : { type: "image_url", image_url: url };
+}
+
+async function runRealtimeOcr(file) {
+  const dataUrl = `data:${file.mimetype || "image/jpeg"};base64,${file.buffer.toString("base64")}`;
+  const response = await withRetry(`${file.originalname} ocr`, () => axios.post(
+    "https://api.mistral.ai/v1/ocr",
+    { model: OCR_3_MODEL, document: toOcrDocument(dataUrl, file.mimetype) },
+    { headers: mistralHeaders, timeout: 120000 }
+  ));
+  return (response.data?.pages || []).map((page) => page?.markdown || "").filter(Boolean).join("\n");
+}
+
+// ─── Multi-read consensus ─────────────────────────────────
+// Measured on the sample images: no single reader (Mistral OCR, mistral-medium,
+// mistral-large, any orientation) is reliable on its own — each one drops or
+// swaps characters on some photos, especially vertical/stamped 2-wheeler
+// chassis numbers. Their mistakes are mostly independent, so a VIN that two or
+// more independent reads agree on is very likely correct.
+const VISION_MODEL_STRONG = process.env.MISTRAL_VISION_MODEL_STRONG || "mistral-large-latest";
+const ROUND2_BUDGET_MS = Number(process.env.OCR_ROUND2_BUDGET_SEC || 120) * 1000;
+
+function visionPrompt(vehicleType) {
+  const normType = normalizeVehicleType(vehicleType);
+  const lengthRule = normType === "commercial_equipment" || normType === "commercial_vehicle"
+    ? "a 10 to 17 character chassis / VIN / product identification number"
+    : "a 17-character code, usually starting with \"M\" for vehicles made in India";
+  return `Find the vehicle VIN / chassis / frame number in this photo (${lengthRule}).
+It may be printed on a sticker or label, engraved or stamped into metal, vertical, rotated or upside down.
+Read it character by character and copy every character exactly; do not skip or add characters.
+Some stickers (e.g. Hyundai) split the VIN over two lines: 11 characters after "VIN:" and the last 6 digits in large print on the next line beside the fuel type (e.g. "VIN: MALB141CLTM" / "PETROL 454752" = "MALB141CLTM454752"). Always return the full joined VIN.
+Carefully distinguish 8/B, 0/D, 5/S, 6/G, 1/I, 2/Z, M/W.
+Do NOT return the body number, model/spec code, engine number, barcode digits, or any text from the GPS/map camera overlay (address, pincode, Lat/Long, date, time).
+Also return the engine number only if it is explicitly labelled, and the fuel type only if written.
+Respond with JSON only: {"vin": "", "engine_number": "", "fuel_type": ""}`;
+}
+
+async function rotatedBuffer(buffer, rotation) {
+  return rotation ? sharp(buffer).rotate(rotation).jpeg({ quality: 92 }).toBuffer() : buffer;
+}
+
+async function visionRead(file, vehicleType, model, rotation = 0) {
+  const buffer = await rotatedBuffer(file.buffer, rotation);
+  const dataUrl = `data:image/jpeg;base64,${buffer.toString("base64")}`;
+  const isReasoningModel = /large/.test(model); // rejects temperature=0, returns content blocks
+  const response = await withRetry(`${file.originalname} ${model}@${rotation}`, () => axios.post(
+    "https://api.mistral.ai/v1/chat/completions",
+    {
+      model,
+      ...(isReasoningModel ? {} : { temperature: 0 }),
+      response_format: { type: "json_object" },
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: visionPrompt(vehicleType) },
+          { type: "image_url", image_url: dataUrl },
+        ],
+      }],
+    },
+    { headers: mistralHeaders, timeout: isReasoningModel ? 90000 : 60000 }
+  ), isReasoningModel ? 2 : MAX_RETRIES);
+
+  let content = response.data?.choices?.[0]?.message?.content || "{}";
+  if (Array.isArray(content)) {
+    content = content.filter((block) => block?.type === "text").map((block) => block.text).join("");
+  }
+  const parsed = normalizeOcrStructuredOutput(String(content));
+  return {
+    source: `${model.replace(/-latest$/, "")}@${rotation}`,
+    vin: postProcessVin(parsed.vin, vehicleType),
+    engine_number: parsed.engine_number || "",
+    fuel_type: parsed.fuel_type || "",
+  };
+}
+
+// Joins VINs printed in two parts, e.g. Hyundai "VIN: MALB141CLTM" + "PETROL 454752".
+function findSplitVins(text = "", vehicleType = "") {
+  const flat = cleanMarkdown(text).toUpperCase().replace(/[|*#_]/g, " ");
+  const pattern = /\bVIN\b\s*(?:NO\.?)?\s*[:.\-]?\s*([A-Z0-9]{11})\b[\s\S]{0,40}?\b(\d{6})\b/g;
+  const found = [];
+  for (const match of flat.matchAll(pattern)) {
+    const vin = postProcessVin(match[1] + match[2], vehicleType);
+    if (isPlausibleVin(vin, vehicleType)) found.push(vin);
+  }
+  return found;
+}
+
+// Mistral OCR on a rotated copy; VIN candidates are taken straight from the text.
+async function rotatedOcrRead(file, vehicleType, rotation) {
+  const buffer = await rotatedBuffer(file.buffer, rotation);
+  const text = await runRealtimeOcr({ ...file, buffer, mimetype: "image/jpeg" });
+  const tokens = cleanMarkdown(text).toUpperCase().replace(/[^A-Z0-9\s]/g, " ").split(/\s+/);
+  const vins = [
+    ...findSplitVins(text, vehicleType),
+    ...tokens.map((token) => postProcessVin(token, vehicleType)).filter((vin) => isPlausibleVin(vin, vehicleType)),
+  ];
+  return { source: `ocr@${rotation}`, vin: vins[0] || "", engine_number: "", fuel_type: "" };
+}
+
+function pickConsensus(reads, vehicleType) {
+  const valid = reads.filter((read) => isPlausibleVin(read.vin, vehicleType));
+  if (valid.length === 0) return null;
+
+  const bySupport = new Map();
+  for (const read of valid) bySupport.set(read.vin, [...(bySupport.get(read.vin) || []), read.source]);
+  const ranked = [...bySupport.entries()].sort((a, b) => b[1].length - a[1].length);
+  const [topVin, topSources] = ranked[0];
+  const runnerUp = ranked[1]?.[1].length || 0;
+
+  if (topSources.length >= 2 && topSources.length > runnerUp) {
+    return { vin: topVin, confidence: topSources.length >= 3 ? "high" : "medium", support: topSources };
   }
 
-  const finalResult = {
-    ...llmResult,
+  // No exact agreement: per-character majority over same-length reads.
+  const length = topVin.length;
+  const sameLength = valid.filter((read) => read.vin.length === length);
+  if (sameLength.length >= 3) {
+    let voted = "";
+    let contested = 0;
+    for (let i = 0; i < length; i++) {
+      const tally = {};
+      for (const read of sameLength) tally[read.vin[i]] = (tally[read.vin[i]] || 0) + 1;
+      const [ch, n] = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
+      if (n * 2 <= sameLength.length) contested++;
+      voted += ch;
+    }
+    if (contested === 0 && isPlausibleVin(voted, vehicleType)) {
+      return { vin: voted, confidence: "low", support: sameLength.map((read) => read.source) };
+    }
+  }
+
+  return { vin: topVin, confidence: "low", support: topSources };
+}
+
+function buildSuccess(file, details, addressDetails, source) {
+  const aiResult = {
+    vin: details.vin,
+    engine_number: details.engine_number || "",
+    hmil: "",
+    invoice_number: "",
+    invoice_date: "",
+    grand_total: "",
+    hyp_hps: "",
+    tag: "audit_image",
+    fuel_type: details.fuel_type || "",
     address: addressDetails.address || "",
-    city: addressDetails.city || llmResult.city || "",
-    state: addressDetails.state || llmResult.state || "",
+    city: addressDetails.city || details.city || "",
+    state: addressDetails.state || details.state || "",
     pincode: addressDetails.pincode || "",
     country: "",
+    confidence: details.confidence || "",
+    vin_reads: details.vin_reads || "",
   };
-  console.log(`[${file.originalname}] Succeeded using DeepSeek after Mistral batch OCR.`);
-  return { file, aiResult: finalResult, success: true, source: "mistral_batch" };
+  return { file, aiResult, success: true, source };
+}
+
+// OCR text (may be empty) + vision reads -> consensus VIN. Never throws.
+async function processOcrResult(file, rawOcrText, vehicleType, addressDetails, ocrError = "") {
+  const reasons = [];
+  const reads = [];
+  if (ocrError) reasons.push(`OCR: ${ocrError}`);
+
+  const settle = async (label, promise) => {
+    try {
+      const read = await promise;
+      reads.push(read);
+    } catch (error) {
+      reasons.push(`${label}: ${describeError(error)}`);
+    }
+  };
+
+  // Round 1: OCR text -> DeepSeek, and one vision read of the photo as taken.
+  const cleanedOcrText = cleanMarkdown(rawOcrText || "").trim();
+  const splitVin = findSplitVins(cleanedOcrText, vehicleType)[0];
+  if (splitVin) reads.push({ source: "ocr_join", vin: splitVin, engine_number: "", fuel_type: "" });
+  await Promise.all([
+    cleanedOcrText
+      ? settle("text extraction", extractVehicleDetailsWithAI(cleanedOcrText, vehicleType)
+        .then((result) => ({ ...result, source: "ocr_text" })))
+      : Promise.resolve(),
+    settle("vision", visionRead(file, vehicleType, VISION_MODEL, 0)),
+  ]);
+
+  // Quick accept only when two INDEPENDENT readers agree (OCR-derived vs vision).
+  const visionFirst = reads.find((r) => !r.source.startsWith("ocr"));
+  const ocrMatch = visionFirst && isPlausibleVin(visionFirst.vin, vehicleType)
+    ? reads.find((r) => r.source.startsWith("ocr") && r.vin === visionFirst.vin)
+    : null;
+  let consensus = ocrMatch
+    ? { vin: visionFirst.vin, confidence: "high", support: [ocrMatch.source, visionFirst.source] }
+    : null;
+
+  // Round 2 (only when round 1 disagrees): more independent reads.
+  if (!consensus) {
+    // Time budget: a slow/hung read must never hold up the image (or the job).
+    let budgetTimer;
+    const budget = new Promise((resolve) => { budgetTimer = setTimeout(resolve, ROUND2_BUDGET_MS); });
+    await Promise.race([
+      Promise.all([
+        settle("vision@90", visionRead(file, vehicleType, VISION_MODEL, 90)),
+        settle("vision@270", visionRead(file, vehicleType, VISION_MODEL, 270)),
+        settle("vision strong", visionRead(file, vehicleType, VISION_MODEL_STRONG, 0)),
+        settle("ocr@90", rotatedOcrRead(file, vehicleType, 90)),
+        settle("ocr@270", rotatedOcrRead(file, vehicleType, 270)),
+        // Small photos: one extra read on a 2x-enlarged copy (fixed tiny sticker text).
+        file.upscaled
+          ? settle("vision upscaled", visionRead({ ...file, buffer: file.upscaled }, vehicleType, VISION_MODEL, 0)
+            .then((read) => ({ ...read, source: `${read.source}x2` })))
+          : Promise.resolve(),
+      ]),
+      budget,
+    ]);
+    clearTimeout(budgetTimer);
+    consensus = pickConsensus([...reads], vehicleType);
+  }
+
+  const readSummary = reads.filter((r) => r.vin).map((r) => `${r.source}=${r.vin}`).join(", ");
+  if (consensus) {
+    const extras = reads.find((r) => r.engine_number || r.fuel_type) || {};
+    console.log(`[${file.originalname}] VIN ${consensus.vin} (${consensus.confidence}; ${consensus.support.join("+")}) reads: ${reads.map((r) => `${r.source}=${r.vin || "-"}`).join(", ")}`);
+    return buildSuccess(file, {
+      vin: consensus.vin,
+      engine_number: reads.find((r) => r.source === "ocr_text")?.engine_number || extras.engine_number || "",
+      fuel_type: reads.find((r) => r.source === "ocr_text")?.fuel_type || extras.fuel_type || "",
+      confidence: consensus.confidence,
+      vin_reads: readSummary,
+    }, addressDetails, `consensus_${consensus.confidence}`);
+  }
+
+  reasons.push(readSummary ? `no read produced a valid VIN (${readSummary})` : "no VIN-like text found by any reader");
+  const reason = reasons.join("; ");
+  console.log(`[${file.originalname}] FAILED: ${reason}`);
+  return failedExtraction(file, "extraction_failed", reason);
+}
+
+async function runBatchOcr(files) {
+  // Returns Map<index, {text, error}> for every file that went through batch.
+  const outcomes = new Map();
+  const requests = [];
+
+  for (const [index, file] of files.entries()) {
+    try {
+      const fileUrl = await withRetry(`${file.originalname} upload`, () => uploadFileToMistral(file));
+      requests.push({ custom_id: String(index), body: { document: toOcrDocument(fileUrl, file.mimetype) } });
+    } catch (error) {
+      outcomes.set(index, { text: "", error: `upload ${describeError(error)}` });
+    }
+  }
+  if (requests.length === 0) return outcomes;
+
+  try {
+    const createdBatch = await withRetry("Mistral batch create", () => createMistralOcrBatch(requests));
+    console.log(`[Mistral batch] Submitted ${createdBatch.id} for ${requests.length} file(s).`);
+    const completedBatch = await waitForMistralBatch(createdBatch.id);
+    const outputs = await withRetry("Mistral batch output", () => getMistralBatchOutputs(completedBatch));
+    const outputsById = new Map(outputs.map((output) => [String(output.custom_id), output]));
+
+    for (const request of requests) {
+      const output = outputsById.get(request.custom_id);
+      const text = getOcrTextFromBatchOutput(output);
+      const statusCode = output?.response?.status_code;
+      const error = text ? "" : (output?.error?.message || (statusCode && statusCode !== 200 ? `HTTP ${statusCode}` : "no batch output"));
+      outcomes.set(Number(request.custom_id), { text, error });
+    }
+  } catch (error) {
+    console.error("[Mistral batch] Job failed, falling back to real-time OCR:", describeError(error));
+    for (const request of requests) {
+      outcomes.set(Number(request.custom_id), { text: "", error: `batch ${describeError(error)}` });
+    }
+  }
+  return outcomes;
 }
 
 // ─── HELPER: run array in batches ─────────────────────────
+// Images processed at the same time. Each image makes up to ~7 Mistral calls,
+// so keep this modest; withRetry absorbs any 429s.
+const OCR_CONCURRENCY = Math.max(1, Number(process.env.OCR_CONCURRENCY || 4));
+// Batch OCR is cheaper but can queue for a long time at Mistral, which delays
+// the report and email. Small/medium uploads use real-time OCR.
+const BATCH_MIN_FILES = Number(process.env.MISTRAL_BATCH_MIN_FILES || 100);
+const MIN_OCR_EDGE = Number(process.env.OCR_MIN_EDGE_PX || 2000);
+
+async function prepareFileForOcr(file) {
+  if (!file.mimetype?.startsWith("image/") && !/\.(jpe?g|png|webp|tiff?|bmp|gif|heic|heif|avif)$/i.test(file.originalname || "")) {
+    return { file, error: `unsupported file type "${file.mimetype || "unknown"}"` };
+  }
+  try {
+    const { buffer: decodable } = await toDecodableImage(file.buffer, file.originalname, file.mimetype);
+    const oriented = await sharp(decodable).rotate().toBuffer();
+    const { width = 0, height = 0 } = await sharp(oriented).metadata();
+    const longest = Math.max(width, height);
+    // Small (e.g. WhatsApp-compressed) photos: sticker text is only a few
+    // pixels tall and gets misread (Toyota "WF13" -> "WE13"). Upscaling to
+    // ~2000px fixed this in testing; large photos are capped at 3000px.
+    // Upscaling every small image hurt stamped/engraved text in testing, so the
+    // enlarged copy is only used as ONE extra vote in round 2 (see processOcrResult).
+    const buffer = await sharp(oriented)
+      .resize({ width: 3000, height: 3000, fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 92 })
+      .toBuffer();
+    const upscaled = longest && longest < MIN_OCR_EDGE
+      ? await sharp(oriented).resize({ width: MIN_OCR_EDGE, height: MIN_OCR_EDGE, fit: "inside", kernel: "lanczos3" }).jpeg({ quality: 95 }).toBuffer()
+      : null;
+    return { file: { ...file, buffer, upscaled, mimetype: "image/jpeg" }, error: "" };
+  } catch (err) {
+    const isHeic = isHeicLike(file.buffer, file.originalname, file.mimetype);
+    return {
+      file,
+      error: isHeic
+        ? `HEIC/HEIF photo could not be decoded (${err.message}); please upload it as JPEG (set the phone camera to 'Most Compatible')`
+        : `image could not be decoded (${err.message})`,
+    };
+  }
+}
+
+async function runPool(count, concurrency, worker) {
+  let next = 0;
+  const runners = Array.from({ length: Math.min(concurrency, count) }, async () => {
+    while (next < count) {
+      const index = next++;
+      await worker(index);
+    }
+  });
+  await Promise.all(runners);
+}
+
 async function processBatches(files, onFileProcessed = () => { }, vehicleType = "", addressDetails = {}) {
   const results = new Array(files.length);
-  const requests = [];
+  const startedAt = Date.now();
+  let notified = 0;
+  const finish = (index, result) => {
+    if (results[index]) return; // never count an image twice
+    results[index] = { ...result, file: files[index] };
+    notified++;
+    onFileProcessed();
+  };
 
-  // Upload serially so the Files API is not hit with the old five-request burst.
-  for (const [index, file] of files.entries()) {
-    try {
-      const fileUrl = await uploadFileToMistral(file);
-      requests.push({
-        custom_id: String(index),
-        body: {
-          document: { type: "document_url", document_url: fileUrl },
-          include_blocks: false,
-        },
-      });
-    } catch (error) {
-      console.error(`[${file.originalname}] Mistral file upload failed:`, error.message);
-      results[index] = failedExtraction(file, "mistral_upload_error", error.message);
-      onFileProcessed();
+  // 1. Normalize every image (EXIF orientation, size cap, JPEG).
+  const prepared = new Array(files.length);
+  await runPool(files.length, OCR_CONCURRENCY, async (index) => {
+    const { file, error } = await prepareFileForOcr(files[index]);
+    prepared[index] = file;
+    if (error) {
+      console.error(`[${files[index].originalname}] ${error}`);
+      finish(index, failedExtraction(files[index], "unsupported_image", error));
     }
+  });
+
+  // 2. Optional batch OCR for large uploads (only for images that decoded).
+  const pending = prepared.map((_, index) => index).filter((index) => !results[index]);
+  const useBatch = OCR_MODE === "batch" || (OCR_MODE === "auto" && pending.length >= BATCH_MIN_FILES);
+  const batchOutcomes = new Map();
+  if (useBatch && pending.length) {
+    const outcomes = await runBatchOcr(pending.map((index) => prepared[index]));
+    pending.forEach((index, position) => {
+      if (outcomes.has(position)) batchOutcomes.set(index, outcomes.get(position));
+    });
   }
 
-  if (requests.length === 0) return results;
+  // 3. Per-image OCR + consensus, several images at a time.
+  let accountError = ""; // 401/402/403: key or billing problem, retrying cannot help
+  await runPool(pending.length, OCR_CONCURRENCY, async (position) => {
+    const index = pending[position];
+    const file = prepared[index];
+    try {
+      let { text = "", error = "" } = batchOutcomes.get(index) || {};
 
-  try {
-    const createdBatch = await createMistralOcrBatch(requests);
-    console.log(`[Mistral batch] Submitted ${createdBatch.id} for ${requests.length} file(s).`);
-    const completedBatch = await waitForMistralBatch(createdBatch.id);
-    const outputs = await getMistralBatchOutputs(completedBatch);
-    const outputsById = new Map(outputs.map((output) => [String(output.custom_id), output]));
+      if (!text && accountError) {
+        finish(index, failedExtraction(files[index], "mistral_account_error", accountError));
+        return;
+      }
 
-    // DeepSeek remains sequential to avoid moving the rate-limit problem to
-    // the downstream extraction provider.
-    for (const request of requests) {
-      const index = Number(request.custom_id);
-      const file = files[index];
-      const output = outputsById.get(request.custom_id);
-      const rawOcrText = getOcrTextFromBatchOutput(output);
-
-      if (!rawOcrText) {
-        const message = output?.error?.message || "No OCR result returned by Mistral batch";
-        console.error(`[${file.originalname}] ${message}`);
-        results[index] = failedExtraction(file, "mistral_batch_ocr_error", message);
-      } else {
+      if (!text) {
         try {
-          results[index] = await processOcrResult(file, rawOcrText, vehicleType, addressDetails);
-        } catch (error) {
-          console.error(`[${file.originalname}] Extraction failed:`, error.message);
-          results[index] = failedExtraction(file, "extraction_error", error.message);
+          text = await runRealtimeOcr(file);
+          error = text ? "" : error;
+        } catch (realtimeError) {
+          error = [error, `realtime ${describeError(realtimeError)}`].filter(Boolean).join(" | ");
+          if (isAccountError(realtimeError)) {
+            accountError = `Mistral account/API key error, check MISTRAL_API_KEY and billing: ${describeError(realtimeError)}`;
+            console.error(`[OCR] ${accountError}`);
+            finish(index, failedExtraction(files[index], "mistral_account_error", accountError));
+            return;
+          }
         }
       }
-      onFileProcessed();
+
+      finish(index, await processOcrResult(file, text, vehicleType, addressDetails, text ? "" : error));
+    } catch (unexpected) {
+      finish(index, failedExtraction(files[index], "processing_error", describeError(unexpected)));
     }
-  } catch (error) {
-    console.error("[Mistral batch] Job failed:", error.message);
-    for (const request of requests) {
-      const index = Number(request.custom_id);
-      results[index] = failedExtraction(files[index], "mistral_batch_error", error.message);
-      onFileProcessed();
-    }
+  });
+
+  // 4. Invariant: exactly one result per uploaded image, in upload order.
+  for (let index = 0; index < files.length; index++) {
+    if (!results[index]) finish(index, failedExtraction(files[index], "not_processed", "image was not processed (internal error)"));
   }
+  console.log(`[processBatches] ${files.length} image(s) in, ${results.filter(Boolean).length} result(s) out, ` +
+    `${results.filter((r) => r.success).length} with VIN, ${Math.round((Date.now() - startedAt) / 1000)}s`);
+  if (notified !== files.length) console.error(`[processBatches] progress count ${notified} != ${files.length}`);
 
   return results;
 }
@@ -1969,7 +2491,13 @@ app.get("/api/progress/:jobId", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // stop nginx buffering the stream
   res.flushHeaders();
+
+  // Heartbeat comment every 15s so proxies/browsers don't drop a quiet stream
+  // while a slow image is being read (EventSource ignores comment lines).
+  const heartbeat = setInterval(() => res.write(": ping\n\n"), 15_000);
+  req.on("close", () => clearInterval(heartbeat));
 
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
   send({
@@ -1988,6 +2516,14 @@ app.get("/api/progress/:jobId", (req, res) => {
   });
 });
 
+// ─── PER-IMAGE RESULTS (JSON) ─────────────────────────────
+app.get("/api/result/:jobId/details", (req, res) => {
+  const job = jobStore.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Not found" });
+  if (job.status !== "done") return res.status(202).json({ status: job.status });
+  res.json({ total: job.total, results: job.details || [] });
+});
+
 // ─── DOWNLOAD RESULT ──────────────────────────────────────
 app.get("/api/result/:jobId", (req, res) => {
   const job = jobStore.get(req.params.jobId);
@@ -1995,12 +2531,138 @@ app.get("/api/result/:jobId", (req, res) => {
   if (job.status === "error") return res.status(500).json({ error: job.error });
   if (job.status !== "done") return res.status(202).json({ status: job.status });
 
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", "attachment; filename=Stockyard_Audit_Management_Report.pdf");
+  if (!job.result) return res.status(500).json({ error: job.resultError || job.reportSaveError || "Result could not be generated" });
+
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", "attachment; filename=Stockyard_Audit_Result.zip");
   res.send(job.result);
 
   setTimeout(() => jobStore.delete(req.params.jobId), 60_000);
 });
+
+// PDF report on its own (the same PDF is also inside the ZIP).
+app.get("/api/result/:jobId/pdf", (req, res) => {
+  const job = jobStore.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Not found" });
+  if (job.status !== "done") return res.status(202).json({ status: job.status });
+  if (!job.pdf) return res.status(500).json({ error: job.reportSaveError || "Report could not be generated" });
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", "attachment; filename=Stockyard_Audit_Management_Report.pdf");
+  res.send(job.pdf);
+});
+
+// ─── RESULT ZIP: vehicles.xlsx + PDF + failed/ + needs_review/ ─────
+async function buildResultZip(files, allResults, addressDetails, reportPdf) {
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet("Sheet1");
+  worksheet.columns = [
+    { header: "File Name", key: "file_name", width: 34 },
+    { header: "VIN", key: "vin", width: 22 },
+    { header: "Engine Number", key: "engine_number", width: 18 },
+    { header: "Fuel Type", key: "fuel_type", width: 12 },
+    { header: "Confidence", key: "confidence", width: 12 },
+    { header: "Status", key: "status", width: 14 },
+    { header: "Failure Reason", key: "reason", width: 50 },
+    { header: "Address", key: "address", width: 24 },
+    { header: "City", key: "city", width: 14 },
+    { header: "State", key: "state", width: 16 },
+    { header: "Pincode", key: "pincode", width: 12 },
+  ];
+
+  const headerRow = worksheet.getRow(1);
+  headerRow.eachCell((cell) => {
+    cell.font = { name: "Arial", bold: true, size: 11, color: { argb: "FFFFFFFF" } };
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
+    cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+    cell.border = {
+      top: { style: "thin", color: { argb: "FF000000" } },
+      left: { style: "thin", color: { argb: "FF000000" } },
+      bottom: { style: "thin", color: { argb: "FF000000" } },
+      right: { style: "thin", color: { argb: "FF000000" } },
+    };
+  });
+  headerRow.height = 20;
+
+  const failedFiles = [];
+  const reviewFiles = [];
+
+  files.forEach((file, index) => {
+    const result = allResults[index];
+    const ai = result?.success ? result.aiResult || {} : {};
+    const confidence = result?.success ? ai.confidence || "" : "";
+    let status = "Failed";
+    if (result?.success) status = confidence === "low" ? "Needs review" : "OK";
+    if (status === "Failed") failedFiles.push(file);
+    if (status === "Needs review") reviewFiles.push(file);
+
+    const row = worksheet.addRow({
+      file_name: file.originalname,
+      vin: ai.vin || "",
+      engine_number: ai.engine_number || "",
+      fuel_type: ai.fuel_type || "",
+      confidence,
+      status,
+      reason: status === "Failed" ? String(result?.error || result?.source || "No VIN found") : "",
+      address: addressDetails.address || ai.address || "",
+      city: addressDetails.city || ai.city || "",
+      state: addressDetails.state || ai.state || "",
+      pincode: addressDetails.pincode || ai.pincode || "",
+    });
+
+    const isEven = row.number % 2 === 0;
+    row.eachCell({ includeEmpty: true }, (cell) => {
+      cell.font = { name: "Arial", size: 10 };
+      cell.alignment = { horizontal: "center", vertical: "middle" };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: isEven ? "FFD9E1F2" : "FFFFFFFF" } };
+      cell.border = {
+        top: { style: "thin", color: { argb: "FFB8CCE4" } },
+        left: { style: "thin", color: { argb: "FFB8CCE4" } },
+        bottom: { style: "thin", color: { argb: "FFB8CCE4" } },
+        right: { style: "thin", color: { argb: "FFB8CCE4" } },
+      };
+    });
+    row.getCell("reason").alignment = { horizontal: "left", vertical: "middle", wrapText: true };
+
+    const statusCell = row.getCell("status");
+    const statusStyle = {
+      OK: { font: "FF375623", fill: "FFC6EFCE" },
+      "Needs review": { font: "FF9C5700", fill: "FFFFEB9C" },
+      Failed: { font: "FF9C0006", fill: "FFFFC7CE" },
+    }[status];
+    statusCell.font = { name: "Arial", size: 10, bold: true, color: { argb: statusStyle.font } };
+    statusCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: statusStyle.fill } };
+  });
+
+  const excelBuffer = await workbook.xlsx.writeBuffer();
+
+  // Unique names inside a folder: "a.jpg", "a_2.jpg", "a_3.jpg"...
+  const uniqueName = (used, name) => {
+    const safe = String(name || "image").replace(/[\\/]/g, "_");
+    if (!used.has(safe.toLowerCase())) { used.add(safe.toLowerCase()); return safe; }
+    const dot = safe.lastIndexOf(".");
+    const base = dot > 0 ? safe.slice(0, dot) : safe;
+    const ext = dot > 0 ? safe.slice(dot) : "";
+    for (let n = 2; ; n++) {
+      const candidate = `${base}_${n}${ext}`;
+      if (!used.has(candidate.toLowerCase())) { used.add(candidate.toLowerCase()); return candidate; }
+    }
+  };
+
+  return new Promise((resolve, reject) => {
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    const buffers = [];
+    archive.on("data", (d) => buffers.push(d));
+    archive.on("end", () => resolve(Buffer.concat(buffers)));
+    archive.on("error", reject);
+    archive.append(Buffer.from(excelBuffer), { name: "vehicles.xlsx" });
+    if (reportPdf) archive.append(reportPdf, { name: "Stockyard_Audit_Management_Report.pdf" });
+    const usedFailed = new Set();
+    failedFiles.forEach((f) => archive.append(f.buffer, { name: `failed/${uniqueName(usedFailed, f.originalname)}` }));
+    const usedReview = new Set();
+    reviewFiles.forEach((f) => archive.append(f.buffer, { name: `needs_review/${uniqueName(usedReview, f.originalname)}` }));
+    archive.finalize();
+  });
+}
 
 // ─── JOB RUNNER ───────────────────────────────────────────
 async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
@@ -2021,27 +2683,67 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
       while (job.processed < job.total) notify();
     }
 
-    const reportPdf = await buildAuditReportPdf({
-      results: allResults,
-      totalImages: job.total,
-      vehicleType,
-      location: addressDetails.city || addressDetails.address || addressDetails.state,
-    });
+    job.details = allResults.map((r, index) => ({
+      index,
+      file: r?.file?.originalname || files[index]?.originalname || "",
+      vin: r?.success ? r.aiResult.vin : "",
+      engine_number: r?.success ? r.aiResult.engine_number : "",
+      confidence: r?.success ? r.aiResult.confidence || "" : "",
+      source: r?.source || "",
+      error: r?.error || "",
+    }));
+    const withVin = allResults.filter((r) => r?.success);
+    const needsReview = withVin.filter((r) => r.aiResult?.confidence === "low");
+    const failed = allResults.filter((r) => !r?.success);
+    const summary = [
+      `Images uploaded: ${job.total}. Results: ${allResults.length}. VIN read: ${withVin.length}. Not read: ${failed.length}.`,
+      needsReview.length
+        ? `Please verify ${needsReview.length} low-confidence VIN(s):\n${needsReview.map((r) => `  - ${r.file.originalname}: ${r.aiResult.vin}`).join("\n")}`
+        : "",
+      failed.length
+        ? `Images without a VIN:\n${failed.map((r) => `  - ${r.file?.originalname}: ${String(r.error || r.source).slice(0, 160)}`).join("\n")}`
+        : "",
+    ].filter(Boolean).join("\n\n");
 
-    job.result = reportPdf;
-    const reportTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    job.reportFileName = `Stockyard_Audit_Management_Report_${reportTimestamp}_${jobId.slice(0, 8)}.pdf`;
+    let reportPdf = null;
     try {
-      await mkdir(reportsDirectory, { recursive: true });
-      await writeFile(path.join(reportsDirectory, job.reportFileName), reportPdf, { flag: "wx" });
-      job.reportPath = path.join("reports", job.reportFileName);
-      console.info(`[runJob] Report saved to ${job.reportPath}`);
+      reportPdf = await buildAuditReportPdf({
+        results: allResults,
+        totalImages: job.total,
+        vehicleType,
+        location: addressDetails.city || addressDetails.address || addressDetails.state,
+      });
     } catch (error) {
-      job.reportSaveError = "The report was generated but could not be saved to the reports folder.";
-      console.error(`[runJob] Failed to save report for job ${jobId}:`, error);
+      // Still email the summary so the client is never left without a report.
+      console.error(`[runJob] PDF generation failed for job ${jobId}:`, error);
+      job.reportSaveError = "The PDF report could not be generated; the email contains the text summary.";
     }
 
-    const emailResult = await sendReportEmail(reportPdf, job.total, jobId);
+    // Download = ZIP (Excel + PDF + failed/ + needs_review/), built from the
+    // ORIGINAL uploaded files. The email still attaches only the PDF.
+    job.pdf = reportPdf;
+    try {
+      job.result = await buildResultZip(files, allResults, addressDetails, reportPdf);
+    } catch (error) {
+      console.error(`[runJob] Result ZIP generation failed for job ${jobId}:`, error);
+      job.result = null;
+      job.resultError = "The result ZIP could not be generated. Check backend logs.";
+    }
+    if (reportPdf) {
+      const reportTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      job.reportFileName = `Stockyard_Audit_Management_Report_${reportTimestamp}_${jobId.slice(0, 8)}.pdf`;
+      try {
+        await mkdir(reportsDirectory, { recursive: true });
+        await writeFile(path.join(reportsDirectory, job.reportFileName), reportPdf, { flag: "wx" });
+        job.reportPath = path.join("reports", job.reportFileName);
+        console.info(`[runJob] Report saved to ${job.reportPath}`);
+      } catch (error) {
+        job.reportSaveError = "The report was generated but could not be saved to the reports folder.";
+        console.error(`[runJob] Failed to save report for job ${jobId}:`, error);
+      }
+    }
+
+    const emailResult = await sendReportEmail(reportPdf, job.total, jobId, summary);
     job.emailStatus = emailResult.status;
     job.emailMessage = emailResult.message;
     job.status = "done";
@@ -2456,6 +3158,9 @@ app.post(
   },
 );
 
-app.listen(5000, () => console.log("Server running at 5000"));
+if (process.env.NO_LISTEN !== "1") {
+  const PORT = Number(process.env.PORT || 5000);
+  app.listen(PORT, () => console.log(`Server running at ${PORT}`));
+}
 
-export { cropVehicleWithPercent, hasGeoLocationWatermark, getPrimaryCropPercent, processBatches, getVehiclePromptBundle, extractVehicleDetailsWithAI };
+export { cropVehicleWithPercent, hasGeoLocationWatermark, getPrimaryCropPercent, processBatches, getVehiclePromptBundle, extractVehicleDetailsWithAI, postProcessVin, isPlausibleVin, prepareImageForOcr, sendReportEmail, processMailOutbox };

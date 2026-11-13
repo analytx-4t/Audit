@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect } from "react";
+import { useRef, useState } from "react";
 import { Upload, X, CheckCircle2, FileSpreadsheet, FileText, Image as ImageIcon, File } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -21,9 +21,6 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
   const [isDragging, setIsDragging] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
 
-  useEffect(() => {
-    if (selectedFiles.length === 0) setShowPreview(false);
-  }, [selectedFiles]);
 
   const accent = {
     blue: {
@@ -95,7 +92,9 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
 
   const isValid = (file: File) => {
     if (types.includes("any")) return true;
-    if (types.includes("image") && file.type.startsWith("image/")) return true;
+    // Some browsers report iPhone HEIC (and other) photos with an empty type,
+    // so also accept by extension instead of silently dropping them.
+    if (types.includes("image") && (file.type.startsWith("image/") || /\.(jpe?g|png|webp|heic|heif|tiff?|bmp)$/i.test(file.name))) return true;
     if (types.includes("excel") && file.name.match(/\.(xls|xlsx)$/i)) return true;
     if (types.includes("pdf") && file.type === "application/pdf") return true;
     return false;
@@ -103,6 +102,10 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
 
   const handleFiles = (incoming: File[]) => {
     const valid = incoming.filter(isValid);
+    const skipped = incoming.filter((file) => !isValid(file));
+    if (skipped.length > 0) {
+      alert(`${skipped.length} file(s) were not added because they are not supported:\n${skipped.slice(0, 10).map((f) => f.name).join("\n")}`);
+    }
     const updated = [...selectedFiles, ...valid];
     setSelectedFiles(updated);
     onFilesChange?.(updated);
@@ -223,7 +226,7 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
         <input
           ref={fileInputRef}
           type="file"
-          accept={types.length === 1 && types[0] === "image" ? "image/*" : "*/*"}
+          accept={types.length === 1 && types[0] === "image" ? "image/*,.heic,.heif" : "*/*"}
           multiple
           className="hidden"
           onChange={(e) => {
@@ -266,7 +269,7 @@ function UploadCard({ title, subtitle, icon: Icon, accentColor, types, onFilesCh
       </div>
 
       {/* Preview Modal */}
-      {showPreview && (
+      {showPreview && selectedFiles.length > 0 && (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-white/10 rounded-2xl w-full max-w-3xl max-h-[80vh] overflow-auto shadow-2xl">
             <div className="flex justify-between items-center px-6 py-4

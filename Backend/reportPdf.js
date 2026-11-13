@@ -368,7 +368,7 @@ function drawPageTwo(doc, metrics) {
 
 export function buildAuditReportPdf({ results, totalImages, vehicleType, location = "", generatedAt = new Date() }) {
   const metrics = calculateAuditMetrics({ results, totalImages, vehicleType, location });
-  const date = new Intl.DateTimeFormat("en-GB", { dateStyle: "medium", timeZone: "UTC" }).format(generatedAt);
+  const date = new Intl.DateTimeFormat("en-GB", { dateStyle: "medium", timeZone: process.env.REPORT_TIMEZONE || "Asia/Kolkata" }).format(generatedAt);
   const doc = new PDFDocument({ size: "A4", margin: 0, bufferPages: false, info: { Title: "Stockyard Audit - AI Management Report" } });
   const chunks = [];
 

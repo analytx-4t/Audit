@@ -91,7 +91,8 @@ function ImageUpload() {
         es.onerror = () => { es.close(); reject(new Error("Connection lost during processing")); };
       });
 
-      // Step 3: Fetch the finished zip
+      // Step 3: Fetch the finished result ZIP (vehicles.xlsx, PDF report,
+      // failed/ and needs_review/ images)
       const resultRes = await fetch(`${Backend}/api/result/${jobId}`);
       if (!resultRes.ok) throw new Error("Failed to download result");
       setReportBlob(await resultRes.blob());
@@ -109,7 +110,7 @@ function ImageUpload() {
     const url = window.URL.createObjectURL(reportBlob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "Stockyard_Audit_Management_Report.pdf";
+    a.download = "Stockyard_Audit_Result.zip";
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -263,7 +264,7 @@ function ImageUpload() {
                   transition-all duration-150 active:scale-[0.98] hover:-translate-y-0.5"
               >
                 <Download className="w-4 h-4" />
-                Download PDF Report
+                Download Results (ZIP)
               </button>
             )}
           </div>

@@ -1,1 +1,4 @@
 reports/*.pdf
+scripts/ocr_eval_*.csv
+reports/outbox/
+reports/mail-log.jsonl

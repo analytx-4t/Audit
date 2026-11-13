@@ -75,9 +75,11 @@ export default function RenameImages() {
   const addFiles = useCallback(
     (incoming: FileList | null) => {
       if (!incoming) return;
-      const imageFiles = Array.from(incoming).filter((f) =>
-        f.type.startsWith("image/")
-      );
+      const isImage = (f: File) =>
+        f.type.startsWith("image/") || /\.(jpe?g|png|webp|heic|heif|tiff?|bmp)$/i.test(f.name);
+      const imageFiles = Array.from(incoming).filter(isImage);
+      const skipped = Array.from(incoming).length - imageFiles.length;
+      if (skipped > 0) alert(`${skipped} file(s) were skipped because they are not images.`);
       if (!imageFiles.length) return;
       setImages((prev) => {
         const merged = [...prev.map((e) => e.file), ...imageFiles];
@@ -108,10 +110,21 @@ export default function RenameImages() {
     setDownloading(true);
     try {
       const zip = new JSZip();
-      const processed = await Promise.all(
-        images.map((entry) => processImageForOcr(entry.file, vehicleType, entry.newName))
-      );
+      // Limited concurrency: firing hundreds of requests at once overloads the
+      // server; every image still ends up in the zip (originals on failure).
+      const processed: { name: string; blob: Blob }[] = new Array(images.length);
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(6, images.length) }, async () => {
+        while (next < images.length) {
+          const index = next++;
+          const entry = images[index];
+          processed[index] = await processImageForOcr(entry.file, vehicleType, entry.newName);
+        }
+      }));
       processed.forEach(({ name, blob }) => zip.file(name, blob));
+      if (Object.keys(zip.files).length !== images.length) {
+        alert(`Warning: ${images.length} images selected but ${Object.keys(zip.files).length} in the zip.`);
+      }
 
       const blob = await zip.generateAsync({ type: "blob" });
       const url = URL.createObjectURL(blob);
@@ -201,7 +214,7 @@ export default function RenameImages() {
           <input
             ref={inputRef}
             type="file"
-            accept="image/*"
+            accept="image/*,.heic,.heif"
             multiple
             className="hidden"
             onChange={(e) => addFiles(e.target.files)}
