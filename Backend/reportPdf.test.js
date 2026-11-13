@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildAuditReportPdf, calculateAuditMetrics } from "./reportPdf.js";
+import {
+  buildAuditReportPdf,
+  calculateAuditMetrics,
+  generateAuditReportExplanations,
+} from "./reportPdf.js";
 
 const results = [
   { success: true, aiResult: { vin: "1HGCM82633A004352", city: "Bengaluru" } },
@@ -40,5 +44,59 @@ test("generates a PDF report for the scan results", async () => {
   });
 
   assert.equal(pdf.subarray(0, 5).toString(), "%PDF-");
+  assert.equal((pdf.toString("latin1").match(/\/Type \/Page\b/g) || []).length, 2);
   assert.ok(pdf.length > 1000);
+});
+
+test("requests three concise, data-grounded explanations for every report section", async () => {
+  const metrics = calculateAuditMetrics({
+    results,
+    totalImages: 4,
+    vehicleType: "four_wheeler",
+    location: "Bengaluru",
+  });
+  const explanations = Object.fromEntries([
+    "executiveSummary",
+    "locationSummary",
+    "toolPerformance",
+    "scanOutcome",
+    "keyFindings",
+    "nextSteps",
+  ].map((section) => [section, ["First fact.", "Second fact.", "Third fact."]]));
+  let request;
+  const client = {
+    chat: {
+      completions: {
+        create: async (body, options) => {
+          request = { body, options };
+          return { choices: [{ message: { content: JSON.stringify(explanations) } }] };
+        },
+      },
+    },
+  };
+
+  const generated = await generateAuditReportExplanations(metrics, client);
+
+  assert.deepEqual(generated, explanations);
+  assert.equal(request.body.model, "deepseek-chat");
+  assert.equal(request.options.timeout, 30_000);
+  assert.match(request.body.messages[1].content, /"submitted":4/);
+  assert.doesNotMatch(request.body.messages[1].content, /1HGCM82633A004352/);
+});
+
+test("rejects malformed DeepSeek explanations so callers can use an explicit fallback", async () => {
+  const client = {
+    chat: {
+      completions: {
+        create: async () => ({
+          choices: [{ message: { content: JSON.stringify({ executiveSummary: ["Only one line."] }) } }],
+        }),
+      },
+    },
+  };
+
+  await assert.rejects(
+    generateAuditReportExplanations(calculateAuditMetrics({ results, totalImages: 4 }), client),
+    /invalid executiveSummary explanation/,
+  );
 });

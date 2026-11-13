@@ -8,10 +8,18 @@ import morgan from "morgan";
 import OpenAI from "openai";
 import ExcelJS from "exceljs";
 import nodemailer from "nodemailer";
-import { buildAuditReportPdf } from "./reportPdf.js";
+import {
+  buildAuditReportPdf,
+  calculateAuditMetrics,
+  generateAuditReportExplanations,
+} from "./reportPdf.js";
+import {
+  recordTemporaryMailReport,
+  startTemporaryMailScheduler,
+} from "./temprory mail/scheduler.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { appendFile, mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { Readable } from "stream";
 import archiver from "archiver";
 import crypto from "crypto";
@@ -1194,6 +1202,35 @@ const reportsDirectory = path.resolve(
   "..",
   "reports",
 );
+const previewReportFileName = "Latest_Stockyard_Audit_Management_Report.pdf";
+let previewSaveQueue = Promise.resolve();
+
+function saveLatestReportPreview(reportBuffer, jobId) {
+  const saveOperation = previewSaveQueue.then(async () => {
+    await mkdir(reportsDirectory, { recursive: true });
+    const temporaryPath = path.join(reportsDirectory, `.${previewReportFileName}.${jobId}.tmp`);
+    const previewPath = path.join(reportsDirectory, previewReportFileName);
+    try {
+      await writeFile(temporaryPath, reportBuffer, { flag: "wx" });
+      await rename(temporaryPath, previewPath);
+
+      const entries = await readdir(reportsDirectory, { withFileTypes: true });
+      const previousReports = entries.filter((entry) =>
+        entry.isFile()
+        && entry.name !== previewReportFileName
+        && /^Stockyard_Audit_Management_Report_.*\.pdf$/i.test(entry.name),
+      );
+      await Promise.all(previousReports.map((entry) =>
+        rm(path.join(reportsDirectory, entry.name)),
+      ));
+      return path.join("reports", previewReportFileName);
+    } finally {
+      await rm(temporaryPath, { force: true });
+    }
+  });
+  previewSaveQueue = saveOperation.catch(() => {});
+  return saveOperation;
+}
 
 // ─── REPORT EMAIL ─────────────────────────────────────────
 // Reliability rules (emails were "sometimes" missing in production):
@@ -1204,6 +1241,7 @@ const reportsDirectory = path.resolve(
 //  * every attempt is appended to reports/mail-log.jsonl for diagnosis;
 //  * dates use REPORT_TIMEZONE (IST by default), not the droplet's UTC clock.
 const REPORT_TIMEZONE = process.env.REPORT_TIMEZONE || "Asia/Kolkata";
+const REPORT_EMAIL_MODE = (process.env.REPORT_EMAIL_MODE || "both").toLowerCase(); // immediate | daily | both
 const outboxDirectory = path.join(reportsDirectory, "outbox");
 const mailLogPath = path.join(reportsDirectory, "mail-log.jsonl");
 const MAIL_RETRY_INTERVAL_MS = Number(process.env.MAIL_RETRY_INTERVAL_MIN || 10) * 60 * 1000;
@@ -2705,14 +2743,22 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
         : "",
     ].filter(Boolean).join("\n\n");
 
+    const reportInput = {
+      results: allResults,
+      totalImages: job.total,
+      vehicleType,
+      location: addressDetails.city || addressDetails.address || addressDetails.state,
+    };
     let reportPdf = null;
     try {
-      reportPdf = await buildAuditReportPdf({
-        results: allResults,
-        totalImages: job.total,
-        vehicleType,
-        location: addressDetails.city || addressDetails.address || addressDetails.state,
-      });
+      // AI explanations (DeepSeek); falls back to metrics-only text if unavailable.
+      let reportExplanations = null;
+      try {
+        reportExplanations = await generateAuditReportExplanations(calculateAuditMetrics(reportInput), openai);
+      } catch (error) {
+        console.error(`[runJob] DeepSeek report explanation failed for job ${jobId}; using a metrics-only fallback:`, error);
+      }
+      reportPdf = await buildAuditReportPdf({ ...reportInput, explanations: reportExplanations });
     } catch (error) {
       // Still email the summary so the client is never left without a report.
       console.error(`[runJob] PDF generation failed for job ${jobId}:`, error);
@@ -2730,12 +2776,16 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
       job.resultError = "The result ZIP could not be generated. Check backend logs.";
     }
     if (reportPdf) {
-      const reportTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      job.reportFileName = `Stockyard_Audit_Management_Report_${reportTimestamp}_${jobId.slice(0, 8)}.pdf`;
+      // Daily 9:00 AM delivery queue (temporary mail feature).
+      if (REPORT_EMAIL_MODE !== "immediate") {
+        try {
+          await recordTemporaryMailReport({ jobId, totalFiles: job.total, reportBuffer: reportPdf });
+        } catch (error) {
+          console.error(`[Temporary mail] Could not queue report for job ${jobId}:`, error);
+        }
+      }
       try {
-        await mkdir(reportsDirectory, { recursive: true });
-        await writeFile(path.join(reportsDirectory, job.reportFileName), reportPdf, { flag: "wx" });
-        job.reportPath = path.join("reports", job.reportFileName);
+        job.reportPath = await saveLatestReportPreview(reportPdf, jobId);
         console.info(`[runJob] Report saved to ${job.reportPath}`);
       } catch (error) {
         job.reportSaveError = "The report was generated but could not be saved to the reports folder.";
@@ -2743,7 +2793,11 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
       }
     }
 
-    const emailResult = await sendReportEmail(reportPdf, job.total, jobId, summary);
+    // REPORT_EMAIL_MODE: "immediate" = email right after the scan,
+    // "daily" = only the 9:00 AM batch the next morning, "both" = both (previous behaviour).
+    const emailResult = REPORT_EMAIL_MODE === "daily"
+      ? { status: "scheduled", message: "The report is queued and will be emailed at 9:00 AM tomorrow." }
+      : await sendReportEmail(reportPdf, job.total, jobId, summary);
     job.emailStatus = emailResult.status;
     job.emailMessage = emailResult.message;
     job.status = "done";
@@ -3159,6 +3213,7 @@ app.post(
 );
 
 if (process.env.NO_LISTEN !== "1") {
+  if (REPORT_EMAIL_MODE !== "immediate") startTemporaryMailScheduler();
   const PORT = Number(process.env.PORT || 5000);
   app.listen(PORT, () => console.log(`Server running at ${PORT}`));
 }
