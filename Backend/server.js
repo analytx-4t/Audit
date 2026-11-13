@@ -8,14 +8,18 @@ import morgan from "morgan";
 import OpenAI from "openai";
 import ExcelJS from "exceljs";
 import nodemailer from "nodemailer";
-import { buildAuditReportPdf } from "./reportPdf.js";
+import {
+  buildAuditReportPdf,
+  calculateAuditMetrics,
+  generateAuditReportExplanations,
+} from "./reportPdf.js";
 import {
   recordTemporaryMailReport,
   startTemporaryMailScheduler,
 } from "./temprory mail/scheduler.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { Readable } from "stream";
 import archiver from "archiver";
 import crypto from "crypto";
@@ -1194,6 +1198,35 @@ const reportsDirectory = path.resolve(
   "..",
   "reports",
 );
+const previewReportFileName = "Latest_Stockyard_Audit_Management_Report.pdf";
+let previewSaveQueue = Promise.resolve();
+
+function saveLatestReportPreview(reportBuffer, jobId) {
+  const saveOperation = previewSaveQueue.then(async () => {
+    await mkdir(reportsDirectory, { recursive: true });
+    const temporaryPath = path.join(reportsDirectory, `.${previewReportFileName}.${jobId}.tmp`);
+    const previewPath = path.join(reportsDirectory, previewReportFileName);
+    try {
+      await writeFile(temporaryPath, reportBuffer, { flag: "wx" });
+      await rename(temporaryPath, previewPath);
+
+      const entries = await readdir(reportsDirectory, { withFileTypes: true });
+      const previousReports = entries.filter((entry) =>
+        entry.isFile()
+        && entry.name !== previewReportFileName
+        && /^Stockyard_Audit_Management_Report_.*\.pdf$/i.test(entry.name),
+      );
+      await Promise.all(previousReports.map((entry) =>
+        rm(path.join(reportsDirectory, entry.name)),
+      ));
+      return path.join("reports", previewReportFileName);
+    } finally {
+      await rm(temporaryPath, { force: true });
+    }
+  });
+  previewSaveQueue = saveOperation.catch(() => {});
+  return saveOperation;
+}
 
 async function sendReportEmail(reportBuffer, totalFiles, jobId) {
   const requiredSettings = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM"];
@@ -2025,11 +2058,25 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
       while (job.processed < job.total) notify();
     }
 
-    const reportPdf = await buildAuditReportPdf({
+    const reportInput = {
       results: allResults,
       totalImages: job.total,
       vehicleType,
       location: addressDetails.city || addressDetails.address || addressDetails.state,
+    };
+    const reportMetrics = calculateAuditMetrics(reportInput);
+    let reportExplanations = null;
+    try {
+      reportExplanations = await generateAuditReportExplanations(reportMetrics, openai);
+    } catch (error) {
+      console.error(
+        `[runJob] DeepSeek report explanation failed for job ${jobId}; using a metrics-only fallback:`,
+        error,
+      );
+    }
+    const reportPdf = await buildAuditReportPdf({
+      ...reportInput,
+      explanations: reportExplanations,
     });
 
     job.result = reportPdf;
@@ -2042,12 +2089,8 @@ async function runJob(jobId, files, vehicleType = "", addressDetails = {}) {
     } catch (error) {
       console.error(`[Temporary mail] Could not queue report for job ${jobId}:`, error);
     }
-    const reportTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    job.reportFileName = `Stockyard_Audit_Management_Report_${reportTimestamp}_${jobId.slice(0, 8)}.pdf`;
     try {
-      await mkdir(reportsDirectory, { recursive: true });
-      await writeFile(path.join(reportsDirectory, job.reportFileName), reportPdf, { flag: "wx" });
-      job.reportPath = path.join("reports", job.reportFileName);
+      job.reportPath = await saveLatestReportPreview(reportPdf, jobId);
       console.info(`[runJob] Report saved to ${job.reportPath}`);
     } catch (error) {
       job.reportSaveError = "The report was generated but could not be saved to the reports folder.";

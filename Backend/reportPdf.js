@@ -19,6 +19,15 @@ const PAGE_HEIGHT = 841.89;
 const MARGIN = 40;
 const CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2;
 
+const EXPLANATION_SECTIONS = [
+  "executiveSummary",
+  "locationSummary",
+  "toolPerformance",
+  "scanOutcome",
+  "keyFindings",
+  "nextSteps",
+];
+
 function isValidVin(vin, vehicleType) {
   const length = vin.length;
   const isCommercial = vehicleType === "commercial_equipment" || vehicleType === "commercial_vehicle";
@@ -90,7 +99,111 @@ export function calculateAuditMetrics({ results = [], totalImages = results.leng
   };
 }
 
-function drawHeader(doc, pageNumber, date, location) {
+function explanationMetrics(metrics) {
+  return {
+    submitted: metrics.submitted,
+    vinRead: metrics.read,
+    formatValid: metrics.valid,
+    formatReview: metrics.invalid,
+    noVinResult: metrics.failed,
+    processingFailures: metrics.processingFailures,
+    processedWithoutVin: metrics.noVinAfterScan,
+    uniqueVins: metrics.uniqueVehicles,
+    repeatPhotos: metrics.duplicatePhotos,
+    readAccuracyPercent: Number((metrics.readAccuracy * 100).toFixed(1)),
+    endToEndValidPercent: Number((metrics.endToEndAccuracy * 100).toFixed(1)),
+    locations: metrics.locations.map(({ submitted, read, valid, failed }) => ({
+      submitted,
+      read,
+      valid,
+      failed,
+    })),
+    stockRegisterProvided: false,
+  };
+}
+
+export async function generateAuditReportExplanations(metrics, client) {
+  const response = await client.chat.completions.create(
+    {
+      model: "deepseek-chat",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: "Write concise, plain-language explanations for a vehicle scan audit report. Use only the supplied metrics; do not infer causes, stock coverage, or facts not present. Return a JSON object with exactly these keys: executiveSummary, locationSummary, toolPerformance, scanOutcome, keyFindings, nextSteps. Each key must contain exactly three short strings, one sentence per string, each directly supported by the metrics. Mention the most important counts or rates. Do not use markdown.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify(explanationMetrics(metrics)),
+        },
+      ],
+    },
+    { timeout: 30_000 },
+  );
+
+  const content = response.choices?.[0]?.message?.content;
+  if (typeof content !== "string") {
+    throw new Error("DeepSeek returned no report explanation content.");
+  }
+
+  let sections;
+  try {
+    sections = JSON.parse(content);
+  } catch (error) {
+    throw new Error(`DeepSeek returned invalid report explanation JSON: ${error.message}`);
+  }
+
+  for (const section of EXPLANATION_SECTIONS) {
+    if (
+      !Array.isArray(sections[section])
+      || sections[section].length !== 3
+      || sections[section].some((line) => typeof line !== "string" || !line.trim())
+    ) {
+      throw new Error(`DeepSeek returned an invalid ${section} explanation.`);
+    }
+    sections[section] = sections[section].map((line) => line.trim().replace(/\s+/g, " "));
+  }
+
+  return sections;
+}
+
+export function createFallbackAuditExplanations(metrics) {
+  const location = metrics.locations[0];
+  return {
+    executiveSummary: [
+      `${metrics.read} of ${metrics.submitted} submitted photos returned a VIN.`,
+      `${metrics.valid} of ${metrics.read} read VINs passed the format check.`,
+      `${metrics.failed} photos had no VIN result; ${metrics.duplicatePhotos} repeat photos were found.`,
+    ],
+    locationSummary: [
+      location ? `${location.name}: ${location.submitted} photos submitted.` : "No location counts were supplied.",
+      location ? `${location.read} photos returned a VIN; ${location.valid} passed the format check.` : "Location-level VIN counts are unavailable.",
+      "Location counts describe scan results, not verified stock coverage.",
+    ],
+    toolPerformance: [
+      `${metrics.processingFailures} scan-service failure(s) occurred.`,
+      `${metrics.noVinAfterScan} processed photo(s) returned no VIN.`,
+      `Read accuracy was ${(metrics.readAccuracy * 100).toFixed(1)}% across VINs returned.`,
+    ],
+    scanOutcome: [
+      `${metrics.valid} VIN(s) passed the selected format check.`,
+      `${metrics.invalid} VIN(s) need format review; ${metrics.failed} photos had no result.`,
+      "Inventory matching is unavailable without a stock register.",
+    ],
+    keyFindings: [
+      `${metrics.uniqueVehicles} unique VIN(s) were identified.`,
+      `${metrics.duplicatePhotos} photo(s) repeated a VIN already seen in the scan.`,
+      "Stock age, model, and coverage cannot be assessed from these scan results.",
+    ],
+    nextSteps: [
+      `${metrics.processingFailures} scan-service failure(s) may need a rerun.`,
+      `${metrics.invalid} format-review VIN(s) should be checked manually.`,
+      "Provide a stock register to verify inventory and calculate coverage.",
+    ],
+  };
+}
+
+function drawHeader(doc, pageNumber, date, location, reportLabel = "") {
   const headerHeight = pageNumber === 1 ? 76 : 58;
   doc.rect(0, 0, PAGE_WIDTH, headerHeight).fill(COLORS.navy);
   doc.rect(0, headerHeight - 3, PAGE_WIDTH, 3).fill(COLORS.teal);
@@ -100,7 +213,12 @@ function drawHeader(doc, pageNumber, date, location) {
     doc.fontSize(16).text("Stockyard Audit · AI Management Report", MARGIN, 17, { width: CONTENT_WIDTH });
     doc.font("Helvetica").fontSize(7.5).fillColor("#D7E0EE")
       .text(`Vehicle audit · ${date} · ${location}`, MARGIN, 42, { width: CONTENT_WIDTH });
-    doc.text("Prepared from uploaded scan results · Scope: image scan only · No stock register provided", MARGIN, 55, { width: CONTENT_WIDTH });
+    doc.text(
+      reportLabel || "Prepared from uploaded scan results · Scope: image scan only · No stock register provided",
+      MARGIN,
+      55,
+      { width: CONTENT_WIDTH },
+    );
   } else {
     doc.fontSize(12).text("Stockyard Audit · AI Management Report", MARGIN, 13, { width: CONTENT_WIDTH });
     doc.font("Helvetica").fontSize(8).fillColor("#D7E0EE")
@@ -189,10 +307,33 @@ function drawSummary(doc, metrics, y) {
   return boxY + textHeight + 22;
 }
 
-function drawPageOne(doc, metrics, { date, location }) {
-  drawHeader(doc, 1, date, location);
+function drawExplanation(doc, lines, y, isFallback) {
+  const height = 41;
+  doc.roundedRect(MARGIN, y, CONTENT_WIDTH, height, 3).fill(COLORS.pale);
+  doc.rect(MARGIN, y, 3, height).fill(COLORS.teal);
+  doc.font("Helvetica-Bold").fontSize(6.5).fillColor(COLORS.teal)
+    .text(
+      isFallback ? "AI explanation · metrics-only fallback (DeepSeek response unavailable)" : "AI explanation",
+      MARGIN + 9,
+      y + 4,
+      { width: CONTENT_WIDTH - 18, lineBreak: false },
+    );
+  lines.forEach((line, index) => {
+    doc.font("Helvetica").fontSize(6.2).fillColor(COLORS.ink)
+      .text(truncateToWidth(doc, line, CONTENT_WIDTH - 20), MARGIN + 9, y + 14 + index * 8, {
+        width: CONTENT_WIDTH - 20,
+        lineBreak: false,
+      });
+  });
+  return y + height;
+}
+
+function drawPageOne(doc, metrics, explanations, { date, location, reportLabel }, isFallback) {
+  drawHeader(doc, 1, date, location, reportLabel);
   drawKpis(doc, metrics);
   let y = drawSummary(doc, metrics, 148);
+  y = drawExplanation(doc, explanations.executiveSummary, y + 4, isFallback) + 6;
+
   sectionTitle(doc, "Scan summary by provided location", y);
   doc.font("Helvetica").fontSize(7).fillColor(COLORS.muted)
     .text("These are scan counts, not stock-list verification or audit coverage.", MARGIN, y + 13);
@@ -205,16 +346,22 @@ function drawPageOne(doc, metrics, { date, location }) {
     String(group.failed),
     `${group.submitted ? ((group.read / group.submitted) * 100).toFixed(1) : "0.0"}%`,
   ]);
+  const locationTableY = y + 28;
   drawTable(doc, {
     x: MARGIN,
-    y: y + 28,
+    y: locationTableY,
     widths: [177, 63, 63, 63, 63, 46],
     headers: ["Provided location", "Photos", "VIN read", "Valid", "No VIN", "Read %"],
     rows: locationRows.length ? locationRows : [["Location not supplied", "0", "0", "0", "0", "0.0%"]],
   });
 
-  const tableY = y + 58 + Math.max(1, locationRows.length) * 19;
-  sectionTitle(doc, "Tool performance", tableY);
+  y = drawExplanation(
+    doc,
+    explanations.locationSummary,
+    locationTableY + 19 + Math.max(1, locationRows.length) * 19 + 5,
+    isFallback,
+  ) + 6;
+  sectionTitle(doc, "Tool performance", y);
   const performanceRows = [
     ["Images submitted", String(metrics.submitted), "Uploaded photos included in this report"],
     ["VIN read", `${metrics.read} · ${metrics.submitted ? ((metrics.read / metrics.submitted) * 100).toFixed(1) : "0.0"}%`, "A non-empty VIN was returned"],
@@ -225,15 +372,22 @@ function drawPageOne(doc, metrics, { date, location }) {
     ["Repeat photos", `${metrics.duplicatePhotos} · ${metrics.read ? ((metrics.duplicatePhotos / metrics.read) * 100).toFixed(1) : "0.0"}%`, `${metrics.uniqueVehicles} unique VIN(s) read`],
     ["Stock-list match", "Not available", "No stock-register file was provided"],
   ];
+  const tableY = y + 16;
   drawTable(doc, {
     x: MARGIN,
-    y: tableY + 16,
+    y: tableY,
     widths: [130, 120, CONTENT_WIDTH - 250],
     headers: ["Metric", "Result", "Note"],
     rows: performanceRows,
     rowHeight: 18,
   });
 
+  drawExplanation(
+    doc,
+    explanations.toolPerformance,
+    tableY + 19 + performanceRows.length * 18 + 5,
+    isFallback,
+  );
   doc.font("Helvetica").fontSize(6).fillColor(COLORS.muted)
     .text("Format validity is a length check only, not a manual confirmation of the VIN or a match against inventory.", MARGIN, 790, { width: CONTENT_WIDTH });
 }
@@ -300,7 +454,7 @@ function drawActionTable(doc, y, actions) {
   });
 }
 
-function drawPageTwo(doc, metrics) {
+function drawPageTwo(doc, metrics, explanations, isFallback) {
   drawHeader(doc, 2, "", "");
   const panelGap = 18;
   const panelWidth = (CONTENT_WIDTH - panelGap) / 2;
@@ -313,10 +467,11 @@ function drawPageTwo(doc, metrics) {
     "Inventory verification",
     "A current stock register is needed to verify vehicles.",
   );
-  doc.moveTo(MARGIN, 210).lineTo(PAGE_WIDTH - MARGIN, 210).strokeColor(COLORS.line).lineWidth(0.7).stroke();
+  drawExplanation(doc, explanations.scanOutcome, 180, isFallback);
+  doc.moveTo(MARGIN, 230).lineTo(PAGE_WIDTH - MARGIN, 230).strokeColor(COLORS.line).lineWidth(0.7).stroke();
 
-  sectionTitle(doc, "Key findings", 226);
-  let y = 246;
+  sectionTitle(doc, "Key findings", 246);
+  let y = 266;
   const processingNote = metrics.processingFailures
     ? `${metrics.processingFailures} scan(s) failed before OCR returned results${metrics.processingStatus ? ` (HTTP ${metrics.processingStatus})` : ""}.`
     : "";
@@ -326,7 +481,8 @@ function drawPageTwo(doc, metrics) {
   y = drawFinding(doc, 4, "Stock coverage cannot be assessed from photos alone.", "No stock list was supplied to identify verified, missing, or unlisted vehicles.", y);
   y = drawFinding(doc, 5, "Stock age, model, and yard breakdowns are unavailable.", "The scan output does not include a stock register with invoice dates, models, and registered locations.", y);
 
-  const actionsY = Math.max(420, y + 11);
+  y = drawExplanation(doc, explanations.keyFindings, y + 2, isFallback);
+  const actionsY = Math.max(463, y + 28);
   sectionTitle(doc, "What to do next", actionsY - 19);
   const actions = [];
   if (metrics.processingFailures) {
@@ -361,13 +517,29 @@ function drawPageTwo(doc, metrics) {
     },
   );
   drawActionTable(doc, actionsY, actions);
+  drawExplanation(
+    doc,
+    explanations.nextSteps,
+    actionsY + 19 + actions.length * 32 + 5,
+    isFallback,
+  );
 
   doc.font("Helvetica").fontSize(6).fillColor(COLORS.muted)
     .text("Scope: scan results only. Format accuracy is based on VIN length; no manual VIN validation or stock-list comparison was performed.", MARGIN, 790, { width: CONTENT_WIDTH });
 }
 
-export function buildAuditReportPdf({ results, totalImages, vehicleType, location = "", generatedAt = new Date() }) {
+export function buildAuditReportPdf({
+  results,
+  totalImages,
+  vehicleType,
+  location = "",
+  generatedAt = new Date(),
+  explanations = null,
+  reportLabel = "",
+}) {
   const metrics = calculateAuditMetrics({ results, totalImages, vehicleType, location });
+  const usingFallback = explanations === null;
+  const reportExplanations = explanations || createFallbackAuditExplanations(metrics);
   const date = new Intl.DateTimeFormat("en-GB", { dateStyle: "medium", timeZone: "UTC" }).format(generatedAt);
   const doc = new PDFDocument({ size: "A4", margin: 0, bufferPages: false, info: { Title: "Stockyard Audit - AI Management Report" } });
   const chunks = [];
@@ -377,12 +549,15 @@ export function buildAuditReportPdf({ results, totalImages, vehicleType, locatio
     doc.on("error", reject);
     doc.on("end", () => resolve(Buffer.concat(chunks)));
 
-    drawPageOne(doc, metrics, {
-      date,
-      location: location || "Location not supplied",
-    });
+    drawPageOne(
+      doc,
+      metrics,
+      reportExplanations,
+      { date, location: location || "Location not supplied", reportLabel },
+      usingFallback,
+    );
     doc.addPage({ size: "A4", margin: 0 });
-    drawPageTwo(doc, metrics);
+    drawPageTwo(doc, metrics, reportExplanations, usingFallback);
     doc.end();
   });
 }
